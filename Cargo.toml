@@ -1,0 +1,13 @@
+[package]
+name = "pathshim"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+license = "Apache-2.0"
+description = "Run a command with a best-effort root filesystem view"
+repository = "https://github.com/compforge/pathshim"
+
+[dependencies]
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
