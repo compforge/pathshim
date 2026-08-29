@@ -10,9 +10,26 @@ use std::path::{Component, Path, PathBuf};
 const META_DIR: &str = ".pathshim";
 const WHITEOUT_LOG: &str = "whiteouts";
 
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) struct BindSpec {
+    pub(crate) source: PathBuf,
+    pub(crate) destination: PathBuf,
+}
+
 #[derive(Debug)]
+// Filesystem-view contract: one invocation resolves every guest path against one
+// deterministic projection set. The supervisor shares this RootView across the
+// command tree so writes and whiteouts are immediately visible to later syscalls.
+// A projection source has one active RootView owner; independent pathshim
+// invocations must not concurrently share it.
 pub(crate) struct RootView {
-    upper: PathBuf,
+    projections: Vec<Projection>,
+}
+
+#[derive(Debug)]
+struct Projection {
+    source: PathBuf,
+    destination: PathBuf,
     whiteouts: Whiteouts,
 }
 
@@ -25,34 +42,120 @@ pub(crate) struct DirEntry {
 }
 
 impl RootView {
+    #[cfg(test)]
     pub(crate) fn open(upper: &Path) -> io::Result<Self> {
-        fs::create_dir_all(upper)?;
-        let upper = fs::canonicalize(upper)?;
-        let meta = upper.join(META_DIR);
-        fs::create_dir_all(&meta)?;
-        let whiteouts = Whiteouts::load(meta.join(WHITEOUT_LOG))?;
-        Ok(Self { upper, whiteouts })
+        Self::open_with_binds(Some(upper), &[])
+    }
+
+    pub(crate) fn open_with_binds(rootfs: Option<&Path>, binds: &[BindSpec]) -> io::Result<Self> {
+        let mut specs = Vec::with_capacity(binds.len() + usize::from(rootfs.is_some()));
+        if let Some(source) = rootfs {
+            specs.push(BindSpec {
+                source: source.to_path_buf(),
+                destination: PathBuf::from("/"),
+            });
+        }
+        specs.extend_from_slice(binds);
+
+        let mut destinations = HashSet::new();
+        let mut projections = Vec::with_capacity(specs.len());
+        for spec in specs {
+            if !spec.destination.is_absolute() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "bind destination must be absolute: {}",
+                        spec.destination.display()
+                    ),
+                ));
+            }
+            let destination = normalize_virtual(&spec.destination)?;
+            if is_reserved(&destination) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "bind destination is reserved for host passthrough: {}",
+                        destination.display()
+                    ),
+                ));
+            }
+            if !destinations.insert(destination.clone()) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("duplicate bind destination: {}", destination.display()),
+                ));
+            }
+            projections.push(Projection::open(&spec.source, destination)?);
+        }
+        projections.sort_by_key(|projection| {
+            std::cmp::Reverse(projection.destination.components().count())
+        });
+        Ok(Self { projections })
+    }
+
+    pub(crate) fn reopen(&self) -> io::Result<Self> {
+        let binds: Vec<_> = self
+            .projections
+            .iter()
+            .map(|projection| BindSpec {
+                source: projection.source.clone(),
+                destination: projection.destination.clone(),
+            })
+            .collect();
+        Self::open_with_binds(None, &binds)
     }
 
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) fn upper(&self) -> &Path {
-        &self.upper
+        self.root_upper()
+            .expect("upper is only available for a root projection")
+    }
+
+    pub(crate) fn root_upper(&self) -> Option<&Path> {
+        self.projections
+            .iter()
+            .find(|projection| projection.destination == Path::new("/"))
+            .map(|projection| projection.source.as_path())
+    }
+
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) fn projection_count(&self) -> usize {
+        self.projections.len()
+    }
+
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) fn probe_path(&self) -> &Path {
+        &self
+            .projections
+            .first()
+            .expect("a filesystem view has at least one projection")
+            .destination
+    }
+
+    pub(crate) fn projects(&self, virtual_path: &Path) -> bool {
+        normalize_virtual(virtual_path)
+            .ok()
+            .is_some_and(|path| self.projection_index(&path).is_some())
+    }
+
+    pub(crate) fn same_projection(&self, first: &Path, second: &Path) -> bool {
+        let Ok(first) = normalize_virtual(first) else {
+            return false;
+        };
+        let Ok(second) = normalize_virtual(second) else {
+            return false;
+        };
+        matches!(
+            (self.projection_index(&first), self.projection_index(&second)),
+            (Some(first), Some(second)) if first == second
+        )
     }
 
     pub(crate) fn resolve_read(&self, virtual_path: &Path) -> io::Result<PathBuf> {
         let virtual_path = normalize_virtual(virtual_path)?;
-        if is_passthrough(&virtual_path) {
-            return Ok(virtual_path);
-        }
-        let rel = relative(&virtual_path);
-        if self.whiteouts.covers(rel) {
-            return Err(io::Error::from_raw_os_error(libc_errno::ENOENT));
-        }
-        let upper = self.upper.join(rel);
-        if upper.symlink_metadata().is_ok() {
-            Ok(upper)
-        } else {
-            Ok(virtual_path)
+        match self.projection_index(&virtual_path) {
+            Some(index) => self.projections[index].resolve_read(&virtual_path),
+            None => Ok(virtual_path),
         }
     }
 
@@ -85,36 +188,24 @@ impl RootView {
 
     pub(crate) fn materialize_directory(&self, virtual_path: &Path) -> io::Result<PathBuf> {
         let virtual_path = normalize_virtual(virtual_path)?;
-        let real_path = self.upper.join(relative(&virtual_path));
+        let Some(root) = self
+            .projections
+            .iter()
+            .find(|projection| projection.destination == Path::new("/"))
+        else {
+            return Err(io::Error::from_raw_os_error(libc_errno::ENOTSUP));
+        };
+        let real_path = root.source.join(relative(&virtual_path));
         fs::create_dir_all(&real_path)?;
         Ok(real_path)
     }
 
     pub(crate) fn prepare_open(&mut self, virtual_path: &Path, flags: i32) -> io::Result<PathBuf> {
         let virtual_path = normalize_virtual(virtual_path)?;
-        if is_passthrough(&virtual_path) {
-            return Ok(virtual_path);
+        match self.projection_index(&virtual_path) {
+            Some(index) => self.projections[index].prepare_open(&virtual_path, flags),
+            None => Ok(virtual_path),
         }
-
-        let write = flags & write_flags() != 0;
-        if !write {
-            return self.resolve_read(&virtual_path);
-        }
-
-        let rel = relative(&virtual_path);
-        let upper = self.upper.join(rel);
-        let merged_exists = !self.whiteouts.covers(rel)
-            && (upper.symlink_metadata().is_ok() || virtual_path.symlink_metadata().is_ok());
-        if flags & libc_flags::O_CREAT != 0 && flags & libc_flags::O_EXCL != 0 && merged_exists {
-            return Err(io::Error::from_raw_os_error(libc_errno::EEXIST));
-        }
-
-        self.ensure_parent(&virtual_path)?;
-        if upper.symlink_metadata().is_err() && !self.whiteouts.covers(rel) {
-            self.copy_lower_entry(&virtual_path, &upper)?;
-        }
-        self.whiteouts.reveal(rel)?;
-        Ok(upper)
     }
 
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -124,23 +215,143 @@ impl RootView {
 
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) fn mkdir(&mut self, virtual_path: &Path, mode: u32) -> io::Result<()> {
-        use std::os::unix::fs::DirBuilderExt;
-
         let virtual_path = normalize_virtual(virtual_path)?;
-        let rel = relative(&virtual_path);
-        if self.entry_exists(&virtual_path) {
-            return Err(io::Error::from_raw_os_error(libc_errno::EEXIST));
-        }
-        self.ensure_parent(&virtual_path)?;
-        let upper = self.upper.join(rel);
-        fs::DirBuilder::new().mode(mode).create(&upper)?;
-        self.whiteouts.reveal(rel)
+        let Some(index) = self.projection_index(&virtual_path) else {
+            return Err(io::Error::from_raw_os_error(libc_errno::ENOTSUP));
+        };
+        self.projections[index].mkdir(&virtual_path, mode)
     }
 
     pub(crate) fn unlink(&mut self, virtual_path: &Path, remove_dir: bool) -> io::Result<()> {
         let virtual_path = normalize_virtual(virtual_path)?;
-        let rel = relative(&virtual_path);
-        let upper = self.upper.join(rel);
+        let Some(index) = self.projection_index(&virtual_path) else {
+            return Err(io::Error::from_raw_os_error(libc_errno::ENOTSUP));
+        };
+        self.projections[index].unlink(&virtual_path, remove_dir)
+    }
+
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) fn rename(&mut self, old: &Path, new: &Path) -> io::Result<()> {
+        let old = normalize_virtual(old)?;
+        let new = normalize_virtual(new)?;
+        let (Some(old_index), Some(new_index)) =
+            (self.projection_index(&old), self.projection_index(&new))
+        else {
+            return Err(io::Error::from_raw_os_error(libc_errno::EXDEV));
+        };
+        if old_index != new_index {
+            return Err(io::Error::from_raw_os_error(libc_errno::EXDEV));
+        }
+        self.projections[old_index].rename(&old, &new)
+    }
+
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) fn symlink(&mut self, target: &Path, link: &Path) -> io::Result<()> {
+        let link = normalize_virtual(link)?;
+        let Some(index) = self.projection_index(&link) else {
+            return Err(io::Error::from_raw_os_error(libc_errno::ENOTSUP));
+        };
+        self.projections[index].symlink(target, &link)
+    }
+
+    pub(crate) fn list_dir(&self, virtual_path: &Path) -> io::Result<Vec<DirEntry>> {
+        let virtual_path = normalize_virtual(virtual_path)?;
+        let Some(index) = self.projection_index(&virtual_path) else {
+            return Err(io::Error::from_raw_os_error(libc_errno::ENOTSUP));
+        };
+        self.projections[index].list_dir(&virtual_path)
+    }
+
+    fn projection_index(&self, virtual_path: &Path) -> Option<usize> {
+        if is_reserved(virtual_path) {
+            return None;
+        }
+        self.projections.iter().position(|projection| {
+            virtual_path == projection.destination
+                || virtual_path.starts_with(&projection.destination)
+        })
+    }
+
+    fn entry_exists(&self, virtual_path: &Path) -> bool {
+        match self.projection_index(virtual_path) {
+            Some(index) => self.projections[index].entry_exists(virtual_path),
+            None => virtual_path.symlink_metadata().is_ok(),
+        }
+    }
+}
+
+impl Projection {
+    fn open(source: &Path, destination: PathBuf) -> io::Result<Self> {
+        fs::create_dir_all(source)?;
+        let source = fs::canonicalize(source)?;
+        let meta = source.join(META_DIR);
+        fs::create_dir_all(&meta)?;
+        let whiteouts = Whiteouts::load(meta.join(WHITEOUT_LOG))?;
+        Ok(Self {
+            source,
+            destination,
+            whiteouts,
+        })
+    }
+
+    fn relative<'a>(&self, virtual_path: &'a Path) -> &'a Path {
+        virtual_path
+            .strip_prefix(&self.destination)
+            .expect("projection selected by destination prefix")
+    }
+
+    fn resolve_read(&self, virtual_path: &Path) -> io::Result<PathBuf> {
+        let rel = self.relative(virtual_path);
+        if self.whiteouts.covers(rel) {
+            return Err(io::Error::from_raw_os_error(libc_errno::ENOENT));
+        }
+        let upper = self.source.join(rel);
+        if upper.symlink_metadata().is_ok() {
+            Ok(upper)
+        } else {
+            Ok(virtual_path.to_path_buf())
+        }
+    }
+
+    fn prepare_open(&mut self, virtual_path: &Path, flags: i32) -> io::Result<PathBuf> {
+        let write = flags & write_flags() != 0;
+        if !write {
+            return self.resolve_read(virtual_path);
+        }
+
+        let rel = self.relative(virtual_path);
+        let upper = self.source.join(rel);
+        let merged_exists = !self.whiteouts.covers(rel)
+            && (upper.symlink_metadata().is_ok() || virtual_path.symlink_metadata().is_ok());
+        if flags & libc_flags::O_CREAT != 0 && flags & libc_flags::O_EXCL != 0 && merged_exists {
+            return Err(io::Error::from_raw_os_error(libc_errno::EEXIST));
+        }
+
+        self.ensure_parent(virtual_path)?;
+        if upper.symlink_metadata().is_err() && !self.whiteouts.covers(rel) {
+            self.copy_lower_entry(virtual_path, &upper)?;
+        }
+        self.whiteouts.reveal(rel)?;
+        Ok(upper)
+    }
+
+    fn mkdir(&mut self, virtual_path: &Path, mode: u32) -> io::Result<()> {
+        use std::os::unix::fs::DirBuilderExt;
+
+        let rel = self.relative(virtual_path);
+        if self.entry_exists(virtual_path) {
+            return Err(io::Error::from_raw_os_error(libc_errno::EEXIST));
+        }
+        self.ensure_parent(virtual_path)?;
+        fs::DirBuilder::new()
+            .mode(mode)
+            .create(self.source.join(rel))?;
+        self.whiteouts.reveal(rel)
+    }
+
+    fn unlink(&mut self, virtual_path: &Path, remove_dir: bool) -> io::Result<()> {
+        let rel = self.relative(virtual_path);
+        let upper = self.source.join(rel);
         let lower_exists = virtual_path.symlink_metadata().is_ok();
         let upper_metadata = upper.symlink_metadata().ok();
         if upper_metadata.is_none() && (!lower_exists || self.whiteouts.covers(rel)) {
@@ -168,21 +379,18 @@ impl RootView {
         Ok(())
     }
 
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    pub(crate) fn rename(&mut self, old: &Path, new: &Path) -> io::Result<()> {
-        let old = normalize_virtual(old)?;
-        let new = normalize_virtual(new)?;
-        if !self.entry_exists(&old) {
+    fn rename(&mut self, old: &Path, new: &Path) -> io::Result<()> {
+        if !self.entry_exists(old) {
             return Err(io::Error::from_raw_os_error(libc_errno::ENOENT));
         }
-        let old_rel = relative(&old);
-        let new_rel = relative(&new);
-        self.ensure_parent(&new)?;
-        let old_upper = self.upper.join(old_rel);
+        let old_rel = self.relative(old);
+        let new_rel = self.relative(new);
+        self.ensure_parent(new)?;
+        let old_upper = self.source.join(old_rel);
         if old_upper.symlink_metadata().is_err() {
-            self.copy_lower_entry_recursive(&old, &old_upper)?;
+            self.copy_lower_entry_recursive(old, &old_upper)?;
         }
-        let new_upper = self.upper.join(new_rel);
+        let new_upper = self.source.join(new_rel);
         if let Ok(metadata) = new_upper.symlink_metadata() {
             if metadata.is_dir() {
                 fs::remove_dir_all(&new_upper)?;
@@ -199,40 +407,38 @@ impl RootView {
         self.whiteouts.reveal(new_rel)
     }
 
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    pub(crate) fn symlink(&mut self, target: &Path, link: &Path) -> io::Result<()> {
+    fn symlink(&mut self, target: &Path, link: &Path) -> io::Result<()> {
         use std::os::unix::fs::symlink;
 
-        let link = normalize_virtual(link)?;
-        if self.entry_exists(&link) {
+        if self.entry_exists(link) {
             return Err(io::Error::from_raw_os_error(libc_errno::EEXIST));
         }
-        self.ensure_parent(&link)?;
-        let rel = relative(&link);
-        symlink(target, self.upper.join(rel))?;
+        self.ensure_parent(link)?;
+        let rel = self.relative(link);
+        symlink(target, self.source.join(rel))?;
         self.whiteouts.reveal(rel)
     }
 
-    pub(crate) fn list_dir(&self, virtual_path: &Path) -> io::Result<Vec<DirEntry>> {
+    fn list_dir(&self, virtual_path: &Path) -> io::Result<Vec<DirEntry>> {
         use std::os::unix::fs::MetadataExt;
 
-        let virtual_path = normalize_virtual(virtual_path)?;
-        let rel = relative(&virtual_path);
+        let rel = self.relative(virtual_path);
         if self.whiteouts.covers(rel) {
             return Err(io::Error::from_raw_os_error(libc_errno::ENOENT));
         }
 
         let mut entries = BTreeMap::<OsString, DirEntry>::new();
-        for base in [&virtual_path, &self.upper.join(rel)] {
+        let upper = self.source.join(rel);
+        for base in [virtual_path, upper.as_path()] {
             let Ok(read_dir) = fs::read_dir(base) else {
                 continue;
             };
             for entry in read_dir.flatten() {
                 let name = entry.file_name();
-                if virtual_path == Path::new("/") && name == META_DIR {
+                if virtual_path == self.destination && name == META_DIR {
                     continue;
                 }
-                let child_rel = Path::new(rel).join(&name);
+                let child_rel = rel.join(&name);
                 if self.whiteouts.covers(&child_rel) {
                     entries.remove(&name);
                     continue;
@@ -254,9 +460,9 @@ impl RootView {
     }
 
     fn entry_exists(&self, virtual_path: &Path) -> bool {
-        let rel = relative(virtual_path);
+        let rel = self.relative(virtual_path);
         !self.whiteouts.covers(rel)
-            && (self.upper.join(rel).symlink_metadata().is_ok()
+            && (self.source.join(rel).symlink_metadata().is_ok()
                 || virtual_path.symlink_metadata().is_ok())
     }
 
@@ -267,7 +473,7 @@ impl RootView {
         if !self.entry_exists(parent) {
             return Err(io::Error::from_raw_os_error(libc_errno::ENOENT));
         }
-        let upper_parent = self.upper.join(relative(parent));
+        let upper_parent = self.source.join(self.relative(parent));
         fs::create_dir_all(upper_parent)
     }
 
@@ -330,7 +536,7 @@ fn relative(path: &Path) -> &Path {
     path.strip_prefix("/").unwrap_or(path)
 }
 
-fn is_passthrough(path: &Path) -> bool {
+fn is_reserved(path: &Path) -> bool {
     ["/dev", "/proc", "/sys"]
         .iter()
         .any(|prefix| path == Path::new(prefix) || path.starts_with(prefix))
@@ -475,9 +681,11 @@ mod libc_flags {
 
 mod libc_errno {
     pub(super) const ENOENT: i32 = 2;
+    pub(super) const EXDEV: i32 = 18;
     pub(super) const EEXIST: i32 = 17;
     pub(super) const ENOTDIR: i32 = 20;
     pub(super) const EISDIR: i32 = 21;
+    pub(super) const ENOTSUP: i32 = 95;
 }
 
 #[cfg(test)]
@@ -617,5 +825,106 @@ mod tests {
             .map(|entry| entry.name)
             .collect();
         assert!(names.contains(&OsString::from("pathshim-only")));
+    }
+
+    #[test]
+    fn bind_projects_only_its_destination_subtree() {
+        let temp = TempDir::new();
+        let source = temp.0.join("bind-upper");
+        let destination = temp.0.join("guest-destination");
+        let outside = temp.0.join("outside.txt");
+        fs::create_dir_all(&destination).unwrap();
+        fs::write(destination.join("lower.txt"), "lower").unwrap();
+        fs::write(&outside, "outside").unwrap();
+
+        let mut root = RootView::open_with_binds(
+            None,
+            &[BindSpec {
+                source: source.clone(),
+                destination: destination.clone(),
+            }],
+        )
+        .unwrap();
+        let source = fs::canonicalize(source).unwrap();
+
+        assert!(root.projects(&destination.join("lower.txt")));
+        assert!(!root.projects(&outside));
+        assert_eq!(
+            root.resolve_read(&destination.join("lower.txt")).unwrap(),
+            destination.join("lower.txt")
+        );
+
+        let upper = root
+            .prepare_open(&destination.join("lower.txt"), libc_flags::O_WRONLY)
+            .unwrap();
+        assert_eq!(upper, source.join("lower.txt"));
+        assert_eq!(fs::read_to_string(upper).unwrap(), "lower");
+        assert_eq!(
+            root.prepare_open(&outside, libc_flags::O_WRONLY).unwrap(),
+            outside
+        );
+    }
+
+    #[test]
+    fn bind_to_slash_is_a_root_projection() {
+        let temp = TempDir::new();
+        let source = temp.0.join("root-bind");
+        let root = RootView::open_with_binds(
+            None,
+            &[BindSpec {
+                source: source.clone(),
+                destination: PathBuf::from("/"),
+            }],
+        )
+        .unwrap();
+        let source = fs::canonicalize(source).unwrap();
+
+        assert_eq!(root.root_upper(), Some(source.as_path()));
+        assert!(root.projects(Path::new("/anywhere")));
+    }
+
+    #[test]
+    fn nested_bind_wins_over_root_projection() {
+        let temp = TempDir::new();
+        let root_source = temp.0.join("root-upper");
+        let bind_source = temp.0.join("bind-upper");
+        let destination = temp.0.join("guest-destination");
+        fs::create_dir_all(&destination).unwrap();
+        fs::write(destination.join("lower.txt"), "lower").unwrap();
+
+        let mut root = RootView::open_with_binds(
+            Some(&root_source),
+            &[BindSpec {
+                source: bind_source.clone(),
+                destination: destination.clone(),
+            }],
+        )
+        .unwrap();
+
+        let nested = root
+            .prepare_open(&destination.join("lower.txt"), libc_flags::O_WRONLY)
+            .unwrap();
+        assert_eq!(
+            nested,
+            fs::canonicalize(bind_source).unwrap().join("lower.txt")
+        );
+
+        let root_path = Path::new("/pathshim-root-projection-test");
+        let root_write = root
+            .prepare_open(root_path, libc_flags::O_CREAT | libc_flags::O_WRONLY)
+            .unwrap();
+        assert_eq!(
+            root_write,
+            fs::canonicalize(root_source)
+                .unwrap()
+                .join("pathshim-root-projection-test")
+        );
+        assert!(!root.same_projection(&destination.join("lower.txt"), root_path));
+        assert_eq!(
+            root.rename(&destination.join("lower.txt"), root_path)
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc_errno::EXDEV)
+        );
     }
 }

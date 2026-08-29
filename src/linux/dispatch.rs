@@ -103,7 +103,7 @@ fn handle_open(listener: RawFd, state: &mut State, notif: &SeccompNotif) -> io::
         Ok(path) => path,
         Err(error) => return respond_error(listener, notif.id, errno(&error)),
     };
-    if passthrough(&virtual_path) {
+    if !state.root.projects(&virtual_path) {
         return respond_continue(listener, notif.id);
     }
     let real_path = match state.root.prepare_open(&virtual_path, flags) {
@@ -165,7 +165,7 @@ fn handle_stat(listener: RawFd, state: &mut State, notif: &SeccompNotif) -> io::
         Ok(path) => path,
         Err(error) => return respond_error(listener, notif.id, errno(&error)),
     };
-    if passthrough(&virtual_path) {
+    if !state.root.projects(&virtual_path) {
         return respond_continue(listener, notif.id);
     }
     let real_path = match state.root.resolve_read(&virtual_path) {
@@ -207,7 +207,7 @@ fn handle_statx(listener: RawFd, state: &mut State, notif: &SeccompNotif) -> io:
             Ok(path) => path,
             Err(error) => return respond_error(listener, notif.id, errno(&error)),
         };
-    if passthrough(&virtual_path) {
+    if !state.root.projects(&virtual_path) {
         return respond_continue(listener, notif.id);
     }
     let real_path = match state.root.resolve_read(&virtual_path) {
@@ -259,7 +259,7 @@ fn handle_access(listener: RawFd, state: &mut State, notif: &SeccompNotif) -> io
         Ok(path) => path,
         Err(error) => return respond_error(listener, notif.id, errno(&error)),
     };
-    if passthrough(&virtual_path) {
+    if !state.root.projects(&virtual_path) {
         return respond_continue(listener, notif.id);
     }
     let real_path = match state.root.resolve_read(&virtual_path) {
@@ -294,6 +294,9 @@ fn handle_mkdir(listener: RawFd, state: &mut State, notif: &SeccompNotif) -> io:
         Ok(path) => path,
         Err(error) => return respond_error(listener, notif.id, errno(&error)),
     };
+    if !state.root.projects(&path) {
+        return respond_continue(listener, notif.id);
+    }
     match state.root.mkdir(&path, mode) {
         Ok(()) => respond_value(listener, notif.id, 0),
         Err(error) => respond_error(listener, notif.id, errno(&error)),
@@ -317,6 +320,9 @@ fn handle_unlink(listener: RawFd, state: &mut State, notif: &SeccompNotif) -> io
         Ok(path) => path,
         Err(error) => return respond_error(listener, notif.id, errno(&error)),
     };
+    if !state.root.projects(&path) {
+        return respond_continue(listener, notif.id);
+    }
     match state.root.unlink(&path, flags & libc::AT_REMOVEDIR != 0) {
         Ok(()) => respond_value(listener, notif.id, 0),
         Err(error) => respond_error(listener, notif.id, errno(&error)),
@@ -357,6 +363,14 @@ fn handle_rename(listener: RawFd, state: &mut State, notif: &SeccompNotif) -> io
         Ok(path) => path,
         Err(error) => return respond_error(listener, notif.id, errno(&error)),
     };
+    let old_projected = state.root.projects(&old);
+    let new_projected = state.root.projects(&new);
+    if !old_projected && !new_projected {
+        return respond_continue(listener, notif.id);
+    }
+    if !old_projected || !new_projected || !state.root.same_projection(&old, &new) {
+        return respond_error(listener, notif.id, libc::EXDEV);
+    }
     match state.root.rename(&old, &new) {
         Ok(()) => respond_value(listener, notif.id, 0),
         Err(error) => respond_error(listener, notif.id, errno(&error)),
@@ -395,7 +409,7 @@ fn handle_readlink(listener: RawFd, state: &mut State, notif: &SeccompNotif) -> 
             Err(error) => respond_error(listener, notif.id, errno(&error)),
         };
     }
-    if passthrough(&virtual_path) {
+    if !state.root.projects(&virtual_path) {
         return respond_continue(listener, notif.id);
     }
     let real_path = match state.root.resolve_read(&virtual_path) {
@@ -429,6 +443,9 @@ fn handle_symlink(listener: RawFd, state: &mut State, notif: &SeccompNotif) -> i
         Ok(path) => path,
         Err(error) => return respond_error(listener, notif.id, errno(&error)),
     };
+    if !state.root.projects(&link) {
+        return respond_continue(listener, notif.id);
+    }
     match state.root.symlink(&target, &link) {
         Ok(()) => respond_value(listener, notif.id, 0),
         Err(error) => respond_error(listener, notif.id, errno(&error)),
@@ -480,7 +497,7 @@ fn handle_chdir(listener: RawFd, state: &mut State, notif: &SeccompNotif) -> io:
         }
     };
 
-    if passthrough(&virtual_path) {
+    if !state.root.projects(&virtual_path) {
         state
             .virtual_cwds
             .insert(remote::process_key(notif.pid), virtual_path);
@@ -533,7 +550,7 @@ fn handle_truncate(listener: RawFd, state: &mut State, notif: &SeccompNotif) -> 
         Ok(path) => path,
         Err(error) => return respond_error(listener, notif.id, errno(&error)),
     };
-    if passthrough(&virtual_path) {
+    if !state.root.projects(&virtual_path) {
         return respond_continue(listener, notif.id);
     }
     let real_path = match state.root.prepare_mutation(&virtual_path) {
@@ -563,7 +580,7 @@ fn handle_chmod(listener: RawFd, state: &mut State, notif: &SeccompNotif) -> io:
         Ok(path) => path,
         Err(error) => return respond_error(listener, notif.id, errno(&error)),
     };
-    if passthrough(&virtual_path) {
+    if !state.root.projects(&virtual_path) {
         return respond_continue(listener, notif.id);
     }
     let real_path = match state.root.prepare_mutation(&virtual_path) {
@@ -605,7 +622,7 @@ fn handle_chown(listener: RawFd, state: &mut State, notif: &SeccompNotif) -> io:
         Ok(path) => path,
         Err(error) => return respond_error(listener, notif.id, errno(&error)),
     };
-    if passthrough(&virtual_path) {
+    if !state.root.projects(&virtual_path) {
         return respond_continue(listener, notif.id);
     }
     let real_path = match state.root.prepare_mutation(&virtual_path) {
@@ -634,7 +651,7 @@ fn handle_utimensat(listener: RawFd, state: &mut State, notif: &SeccompNotif) ->
             Ok(path) => path,
             Err(error) => return respond_error(listener, notif.id, errno(&error)),
         };
-    if passthrough(&virtual_path) {
+    if !state.root.projects(&virtual_path) {
         return respond_continue(listener, notif.id);
     }
     let real_path = match state.root.prepare_mutation(&virtual_path) {
@@ -694,12 +711,6 @@ fn read_and_resolve(
 
 fn c_path(path: &Path) -> Result<CString, i32> {
     CString::new(path.as_os_str().as_bytes()).map_err(|_| libc::EINVAL)
-}
-
-fn passthrough(path: &Path) -> bool {
-    ["/dev", "/proc", "/sys"]
-        .iter()
-        .any(|prefix| path == Path::new(prefix) || path.starts_with(prefix))
 }
 
 fn respond_continue(listener: RawFd, id: u64) -> io::Result<()> {
