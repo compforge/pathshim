@@ -56,6 +56,23 @@ impl RootView {
         }
     }
 
+    pub(crate) fn resolve_directory(&self, virtual_path: &Path) -> io::Result<PathBuf> {
+        let virtual_path = normalize_virtual(virtual_path)?;
+        let real_path = self.resolve_read(&virtual_path)?;
+        match real_path.metadata() {
+            Ok(metadata) if metadata.is_dir() => Ok(virtual_path),
+            Ok(_) => Err(io::Error::from_raw_os_error(libc_errno::ENOTDIR)),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub(crate) fn materialize_directory(&self, virtual_path: &Path) -> io::Result<PathBuf> {
+        let virtual_path = normalize_virtual(virtual_path)?;
+        let real_path = self.upper.join(relative(&virtual_path));
+        fs::create_dir_all(&real_path)?;
+        Ok(real_path)
+    }
+
     pub(crate) fn prepare_open(&mut self, virtual_path: &Path, flags: i32) -> io::Result<PathBuf> {
         let virtual_path = normalize_virtual(virtual_path)?;
         if is_passthrough(&virtual_path) {
@@ -504,6 +521,37 @@ mod tests {
         assert_eq!(root.upper(), fs::canonicalize(&rootfs).unwrap());
         assert!(root.upper().join(META_DIR).is_dir());
         assert!(!root.upper().join("project").exists());
+    }
+
+    #[test]
+    fn resolves_and_materializes_guest_directories() {
+        let temp = TempDir::new();
+        let root = RootView::open(&temp.0).unwrap();
+        fs::create_dir_all(temp.0.join("workspace")).unwrap();
+
+        assert_eq!(
+            root.resolve_directory(Path::new("workspace/../workspace"))
+                .unwrap(),
+            PathBuf::from("/workspace")
+        );
+        assert_eq!(
+            root.materialize_directory(Path::new("/lower-only/cwd"))
+                .unwrap(),
+            root.upper().join("lower-only/cwd")
+        );
+    }
+
+    #[test]
+    fn rejects_missing_guest_directory() {
+        let temp = TempDir::new();
+        let root = RootView::open(&temp.0).unwrap();
+
+        assert_eq!(
+            root.resolve_directory(Path::new("/pathshim-missing-cwd"))
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc_errno::ENOENT)
+        );
     }
 
     #[test]

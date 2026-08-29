@@ -40,27 +40,37 @@ fn main() {
             exec(command);
         }
     };
-    configure_virtual_environment(&mut command);
+    let guest_cwd = match root.resolve_directory(&args.cwd) {
+        Ok(cwd) => cwd,
+        Err(error) => {
+            eprintln!(
+                "pathshim: guest cwd unavailable requested={} fallback=/ error={error}",
+                args.cwd.display()
+            );
+            Path::new("/").to_path_buf()
+        }
+    };
+    configure_virtual_environment(&mut command, &guest_cwd);
 
-    run(root, command);
+    run(root, command, guest_cwd);
 }
 
-fn configure_virtual_environment(command: &mut Command) {
+fn configure_virtual_environment(command: &mut Command, guest_cwd: &Path) {
     command
-        .current_dir("/")
+        .current_dir(guest_cwd)
         .env("PATHSHIM_ROOTFS", "/")
-        .env("PWD", "/");
+        .env("PWD", guest_cwd);
 }
 
-fn configure_fallback_environment(command: &mut Command, rootfs: &Path) {
+fn configure_fallback_environment(command: &mut Command, rootfs: &Path, cwd: &Path) {
     command
-        .current_dir(rootfs)
+        .current_dir(cwd)
         .env("PATHSHIM_ROOTFS", rootfs)
-        .env("PWD", rootfs);
+        .env("PWD", cwd);
 }
 
 #[cfg(target_os = "linux")]
-fn run(root: RootView, command: Command) -> ! {
+fn run(root: RootView, command: Command, guest_cwd: std::path::PathBuf) -> ! {
     match linux::run(root, command) {
         Ok(linux::RunOutcome::Exited(status)) => process::exit(status),
         Ok(linux::RunOutcome::Unavailable {
@@ -68,7 +78,8 @@ fn run(root: RootView, command: Command) -> ! {
             mut command,
             reason,
         }) => {
-            configure_fallback_environment(&mut command, root.upper());
+            let cwd = fallback_cwd(&root, &guest_cwd);
+            configure_fallback_environment(&mut command, root.upper(), &cwd);
             eprintln!("pathshim: collect mode=cwd reason={reason}");
             exec(command);
         }
@@ -80,10 +91,25 @@ fn run(root: RootView, command: Command) -> ! {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn run(root: RootView, mut command: Command) -> ! {
-    configure_fallback_environment(&mut command, root.upper());
+fn run(root: RootView, mut command: Command, guest_cwd: std::path::PathBuf) -> ! {
+    let cwd = fallback_cwd(&root, &guest_cwd);
+    configure_fallback_environment(&mut command, root.upper(), &cwd);
     eprintln!("pathshim: collect mode=cwd reason=cow-root-requires-linux");
     exec(command);
+}
+
+fn fallback_cwd(root: &RootView, guest_cwd: &Path) -> std::path::PathBuf {
+    match root.materialize_directory(guest_cwd) {
+        Ok(cwd) => cwd,
+        Err(error) => {
+            eprintln!(
+                "pathshim: cannot materialize fallback cwd={} fallback={} error={error}",
+                guest_cwd.display(),
+                root.upper().display()
+            );
+            root.upper().to_path_buf()
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -104,12 +130,13 @@ mod tests {
     #[test]
     fn fallback_changes_only_root_marker_and_working_directory() {
         let rootfs = Path::new("/rootfs/one");
+        let cwd = Path::new("/rootfs/one/workspace");
         let mut command = Command::new("true");
         command.env("HOME", "/caller/home");
 
-        configure_fallback_environment(&mut command, rootfs);
+        configure_fallback_environment(&mut command, rootfs, cwd);
 
-        assert_eq!(command.get_current_dir(), Some(rootfs));
+        assert_eq!(command.get_current_dir(), Some(cwd));
         let environment: std::collections::HashMap<_, _> = command.get_envs().collect();
         assert_eq!(
             environment.get(OsStr::new("HOME")).copied().flatten(),
@@ -121,6 +148,10 @@ mod tests {
                 .copied()
                 .flatten(),
             Some(OsStr::new("/rootfs/one"))
+        );
+        assert_eq!(
+            environment.get(OsStr::new("PWD")).copied().flatten(),
+            Some(OsStr::new("/rootfs/one/workspace"))
         );
     }
 }
