@@ -30,7 +30,7 @@ fn main() {
     let mut command = Command::new(&args.command);
     command.args(&args.args);
 
-    let root = match RootView::open(&args.rootfs) {
+    let mut root = match RootView::open(&args.rootfs) {
         Ok(root) => root,
         Err(error) => {
             eprintln!(
@@ -42,17 +42,28 @@ fn main() {
     };
     let guest_cwd = match root.resolve_directory(&args.cwd) {
         Ok(cwd) => cwd,
-        Err(error) => {
-            eprintln!(
-                "pathshim: guest cwd unavailable requested={} fallback=/ error={error}",
-                args.cwd.display()
-            );
-            Path::new("/").to_path_buf()
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            match root.create_directory_all(&args.cwd) {
+                Ok(cwd) => {
+                    eprintln!("pathshim: created guest cwd path={}", cwd.display());
+                    cwd
+                }
+                Err(error) => fallback_guest_cwd(&args.cwd, error),
+            }
         }
+        Err(error) => fallback_guest_cwd(&args.cwd, error),
     };
     configure_virtual_environment(&mut command, &guest_cwd);
 
     run(root, command, guest_cwd);
+}
+
+fn fallback_guest_cwd(requested: &Path, error: std::io::Error) -> std::path::PathBuf {
+    eprintln!(
+        "pathshim: guest cwd unavailable requested={} fallback=/ error={error}",
+        requested.display()
+    );
+    Path::new("/").to_path_buf()
 }
 
 fn configure_virtual_environment(command: &mut Command, guest_cwd: &Path) {

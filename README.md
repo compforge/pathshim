@@ -26,7 +26,7 @@ Within the supported filesystem operations:
 | PRoot | `ptrace` observes syscalls and translates paths between guest and host rootfs. | Broad userspace chroot emulation, with `ptrace` availability and tracing overhead. |
 | pathshim | Seccomp user notification delegates selected filesystem syscalls to a supervisor, which applies host-read-fallback and COW writes to rootfs. | Deliberately incomplete projection that degrades instead of preventing command startup. |
 
-Use `-w`, `--cwd`, or `--pwd` to select the initial working directory inside the guest view. The default is `/`. The path is normalized and checked against the merged upper/lower view; a missing or non-directory value emits a warning and falls back to `/`.
+Use `-w`, `--cwd`, or `--pwd` to select the initial working directory inside the guest view. The default is `/`. The path is normalized and checked against the merged upper/lower view. A missing directory is created in the writable upper; a non-directory path or creation failure emits a warning and falls back to `/`.
 
 ## Example
 

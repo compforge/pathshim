@@ -22,7 +22,7 @@ pathshim -r <path> --cwd <guest-path> [--] <command> [args...]
 - 读取路径时优先使用 rootfs 中的文件；rootfs 不存在对应文件时回退到宿主全局路径。
 - 新建和修改的文件应尽可能写入 rootfs，而不是修改宿主 lower。
 - command 本身、后续启动的可执行文件及其运行时依赖可以继续从宿主全局路径加载，因此 rootfs 不需要包含完整文件系统树。
-- `--cwd`、`--pwd` 或 `-w` 指定 guest 视图中的初始工作目录，默认 `/`；目录无效时回退 `/`，不得把 upper 的物理路径暴露为 guest cwd。
+- `--cwd`、`--pwd` 或 `-w` 指定 guest 视图中的初始工作目录，默认 `/`；目录缺失时在 upper 中创建，路径不是目录或创建失败时回退 `/`，不得把 upper 的物理路径暴露为 guest cwd。该行为有意区别于 PRoot 的缺失即回退，更符合 pathshim 收拢运行产物的职责。
 - cwd 状态应覆盖常见的 `chdir`、`fchdir`、`getcwd`、相对路径、`/proc/self/cwd`、pthread 共享和 fork 后独立修改。当前 filesystem 通知流没有可关联 clone flags 与 child pid 的生命周期事件，因此任意 `clone(CLONE_FS)` 的精确共享与 fork 时刻快照只做 best effort。
 - 无法覆盖的 syscall、运行时或路径场景必须被视为能力缺口；不得把 best-effort 行为描述成完整隔离。
 - command 可启动性优先于文件收拢能力。pathshim 应基于现场行为探测依次选择 `cow-root`、`cwd`、`passthrough`，不得依赖发行版或内核版本名单；rootfs 不存在时由 pathshim 创建。

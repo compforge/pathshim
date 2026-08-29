@@ -66,6 +66,23 @@ impl RootView {
         }
     }
 
+    pub(crate) fn create_directory_all(&mut self, virtual_path: &Path) -> io::Result<PathBuf> {
+        let virtual_path = normalize_virtual(virtual_path)?;
+        let mut current = PathBuf::from("/");
+        for component in relative(&virtual_path).components() {
+            current.push(component);
+            if self.entry_exists(&current) {
+                let real_path = self.resolve_read(&current)?;
+                if !real_path.metadata()?.is_dir() {
+                    return Err(io::Error::from_raw_os_error(libc_errno::ENOTDIR));
+                }
+                continue;
+            }
+            self.mkdir(&current, 0o755)?;
+        }
+        Ok(virtual_path)
+    }
+
     pub(crate) fn materialize_directory(&self, virtual_path: &Path) -> io::Result<PathBuf> {
         let virtual_path = normalize_virtual(virtual_path)?;
         let real_path = self.upper.join(relative(&virtual_path));
@@ -538,6 +555,26 @@ mod tests {
             root.materialize_directory(Path::new("/lower-only/cwd"))
                 .unwrap(),
             root.upper().join("lower-only/cwd")
+        );
+    }
+
+    #[test]
+    fn creates_missing_guest_directory_without_shadowing_files() {
+        let temp = TempDir::new();
+        let mut root = RootView::open(&temp.0).unwrap();
+        fs::write(temp.0.join("file"), "not a directory").unwrap();
+
+        assert_eq!(
+            root.create_directory_all(Path::new("/workspace/nested"))
+                .unwrap(),
+            PathBuf::from("/workspace/nested")
+        );
+        assert!(temp.0.join("workspace/nested").is_dir());
+        assert_eq!(
+            root.create_directory_all(Path::new("/file/nested"))
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc_errno::ENOTDIR)
         );
     }
 
