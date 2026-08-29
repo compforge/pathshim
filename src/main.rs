@@ -11,8 +11,12 @@ use std::process::{self, Command};
 use std::os::unix::process::CommandExt;
 
 use cli::{ParseResult, HELP};
-use root::RootView;
+use root::{BindSpec, RootView};
 
+// Startup contract: filesystem collection is optional. When a valid invocation
+// discovers before exec that the requested view is unavailable, pathshim must
+// degrade until it can run the original command; the terminal fallback preserves
+// the caller's program, arguments, inherited environment, and working directory.
 fn main() {
     let parsed = match cli::parse(env::args_os().skip(1)) {
         Ok(parsed) => parsed,
@@ -30,12 +34,23 @@ fn main() {
     let mut command = Command::new(&args.command);
     command.args(&args.args);
 
-    let mut root = match RootView::open(&args.rootfs) {
+    let binds: Vec<_> = args
+        .binds
+        .into_iter()
+        .map(|bind| BindSpec {
+            source: bind.source,
+            destination: bind.destination,
+        })
+        .collect();
+    let mut root = match RootView::open_with_binds(args.rootfs.as_deref(), &binds) {
         Ok(root) => root,
         Err(error) => {
             eprintln!(
-                "pathshim: collect mode=passthrough reason=rootfs-unavailable rootfs={} error={error}",
-                args.rootfs.display()
+                "pathshim: collect mode=passthrough reason=filesystem-view-unavailable rootfs={} binds={} error={error}",
+                args.rootfs
+                    .as_deref()
+                    .map_or_else(|| "<none>".into(), |path| path.display().to_string()),
+                binds.len()
             );
             exec(command);
         }
@@ -86,27 +101,46 @@ fn run(root: RootView, command: Command, guest_cwd: std::path::PathBuf) -> ! {
         Ok(linux::RunOutcome::Exited(status)) => process::exit(status),
         Ok(linux::RunOutcome::Unavailable {
             root,
-            mut command,
+            command,
             reason,
         }) => {
-            let cwd = fallback_cwd(&root, &guest_cwd);
-            configure_fallback_environment(&mut command, root.upper(), &cwd);
-            eprintln!("pathshim: collect mode=cwd reason={reason}");
-            exec(command);
+            if let Some(rootfs) = root.root_upper() {
+                let cwd = fallback_cwd(&root, &guest_cwd);
+                let mut command = command;
+                configure_fallback_environment(&mut command, rootfs, &cwd);
+                eprintln!("pathshim: collect mode=cwd reason={reason}");
+                exec(command);
+            }
+            eprintln!("pathshim: collect mode=passthrough reason={reason}");
+            exec(passthrough_command(&command));
         }
         Err(error) => {
-            eprintln!("pathshim: cannot run command with COW root: {error}");
+            eprintln!("pathshim: cannot run command with COW filesystem view: {error}");
             process::exit(1);
         }
     }
 }
 
 #[cfg(not(target_os = "linux"))]
-fn run(root: RootView, mut command: Command, guest_cwd: std::path::PathBuf) -> ! {
-    let cwd = fallback_cwd(&root, &guest_cwd);
-    configure_fallback_environment(&mut command, root.upper(), &cwd);
-    eprintln!("pathshim: collect mode=cwd reason=cow-root-requires-linux");
-    exec(command);
+fn run(root: RootView, command: Command, guest_cwd: std::path::PathBuf) -> ! {
+    if let Some(rootfs) = root.root_upper() {
+        let cwd = fallback_cwd(&root, &guest_cwd);
+        let mut command = command;
+        configure_fallback_environment(&mut command, rootfs, &cwd);
+        eprintln!("pathshim: collect mode=cwd reason=cow-root-requires-linux");
+        exec(command);
+    }
+    eprintln!("pathshim: collect mode=passthrough reason=cow-bind-requires-linux");
+    exec(passthrough_command(&command));
+}
+
+fn passthrough_command(command: &Command) -> Command {
+    // The COW attempt has already attached a virtual cwd and environment to
+    // `command`. Rebuilding it is the only way to recover normal Command
+    // inheritance because std::process::Command cannot clear current_dir.
+    let mut passthrough = Command::new(command.get_program());
+    passthrough.args(command.get_args());
+    passthrough
 }
 
 fn fallback_cwd(root: &RootView, guest_cwd: &Path) -> std::path::PathBuf {
@@ -164,5 +198,25 @@ mod tests {
             environment.get(OsStr::new("PWD")).copied().flatten(),
             Some(OsStr::new("/rootfs/one/workspace"))
         );
+    }
+
+    #[test]
+    fn terminal_passthrough_restores_normal_command_inheritance() {
+        let mut configured = Command::new("/bin/sh");
+        configured
+            .args(["-c", "true"])
+            .current_dir("/virtual/cwd")
+            .env("PATHSHIM_ROOTFS", "/")
+            .env("PWD", "/virtual/cwd");
+
+        let passthrough = passthrough_command(&configured);
+
+        assert_eq!(passthrough.get_program(), OsStr::new("/bin/sh"));
+        assert_eq!(
+            passthrough.get_args().collect::<Vec<_>>(),
+            vec![OsStr::new("-c"), OsStr::new("true")]
+        );
+        assert_eq!(passthrough.get_current_dir(), None);
+        assert_eq!(passthrough.get_envs().count(), 0);
     }
 }

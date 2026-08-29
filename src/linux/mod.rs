@@ -6,8 +6,9 @@ mod sysno;
 use std::collections::HashMap;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::CommandExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::Arc;
@@ -52,7 +53,7 @@ impl State {
 }
 
 pub(crate) fn run(root: RootView, mut command: Command) -> io::Result<RunOutcome> {
-    let supervisor_root = match RootView::open(root.upper()) {
+    let supervisor_root = match root.reopen() {
         Ok(root) => root,
         Err(error) => {
             return Ok(RunOutcome::Unavailable {
@@ -87,7 +88,7 @@ pub(crate) fn run(root: RootView, mut command: Command) -> io::Result<RunOutcome
         // The caller owns the execution process group. Fork and exec preserve
         // that PGID; creating a nested group here would let the command escape
         // a supervisor that kills pathshim's group as one execution.
-        child_main(child_socket, &mut command);
+        child_main(child_socket, &mut command, root.probe_path());
     }
     drop(child_socket);
 
@@ -175,7 +176,10 @@ pub(crate) fn run(root: RootView, mut command: Command) -> io::Result<RunOutcome
         });
     }
 
-    eprintln!("pathshim: collect mode=cow-root features=host-read-fallback,copy-up,whiteout");
+    eprintln!(
+        "pathshim: collect mode=cow-view projections={} features=host-read-fallback,copy-up,whiteout",
+        root.projection_count()
+    );
     if let Err(error) = write_byte(parent_socket.as_raw_fd(), 1) {
         drop(signal_forwarding);
         stop_attempt(pid, &stop, supervisor);
@@ -253,7 +257,7 @@ extern "C" fn forward_signal(signal: i32) {
     }
 }
 
-fn child_main(socket: OwnedFd, command: &mut Command) -> ! {
+fn child_main(socket: OwnedFd, command: &mut Command, probe_path: &Path) -> ! {
     let listener = match seccomp::install_listener() {
         Ok(listener) => listener,
         Err(error) => {
@@ -269,7 +273,7 @@ fn child_main(socket: OwnedFd, command: &mut Command) -> ! {
     if let Err(error) = read_byte(socket.as_raw_fd()) {
         child_error(format!("cannot synchronize filesystem supervisor: {error}"));
     }
-    if let Err(error) = probe_projection() {
+    if let Err(error) = probe_projection(probe_path) {
         let _ = write_i32(
             socket.as_raw_fd(),
             error.raw_os_error().unwrap_or(libc::EIO),
@@ -291,13 +295,14 @@ fn child_main(socket: OwnedFd, command: &mut Command) -> ! {
     ));
 }
 
-fn probe_projection() -> io::Result<()> {
-    let root = c"/";
+fn probe_projection(probe_path: &Path) -> io::Result<()> {
+    let path = std::ffi::CString::new(probe_path.as_os_str().as_bytes())
+        .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
     let mut stat: libc::stat = unsafe { std::mem::zeroed() };
-    if unsafe { libc::fstatat(libc::AT_FDCWD, root.as_ptr(), &mut stat, 0) } < 0 {
+    if unsafe { libc::fstatat(libc::AT_FDCWD, path.as_ptr(), &mut stat, 0) } < 0 {
         return Err(io::Error::last_os_error());
     }
-    let fd = unsafe { libc::open(root.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY) };
+    let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY) };
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
