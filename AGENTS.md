@@ -19,6 +19,7 @@ pathshim 是独立的通用项目，通过根映射或局部 bind 把进程运�
 ## 代码地图
 
 ```text
+VERSION                 # pathshim 对外版本号
 src/
 ├── main.rs             # invocation 主流程、能力降级与最终 exec
 ├── cli.rs              # rootfs、bind、guest cwd 和 command 参数
@@ -39,6 +40,7 @@ tests/
 
 ## 开发约定
 
+- 每个可发布改动都必须递增根目录 `VERSION`，默认提升 patch 版本，并同步 `Cargo.toml` 与 `Cargo.lock`；CLI 测试负责校验版本源一致。
 - 不把网络、进程、权限限制等 sandbox 策略带入 pathshim；文件收拢是唯一职责。
 - CLI 与调用契约只表达 source 对应 guest destination 的语义，不把 seccomp、ptrace、FUSE 等机制变成参数或上层概念；README 可以用机制对比解释能力边界和现场要求。
 - 运行日志应说明实际启用的收拢能力和降级原因，避免调用方误判覆盖范围。

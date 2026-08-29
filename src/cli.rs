@@ -14,7 +14,8 @@ Options:
                        Collect writes below guest DEST into SOURCE; may be repeated
   -w, --cwd, --pwd <PATH>
                        Initial working directory in the guest filesystem [default: /]
-  -h, --help          Print help
+  -h, --help           Print help
+  -V, --version        Print version
 ";
 
 #[derive(Debug, Eq, PartialEq)]
@@ -36,6 +37,7 @@ pub(crate) struct BindArg {
 pub(crate) enum ParseResult {
     Run(RunArgs),
     Help,
+    Version,
 }
 
 pub(crate) fn parse<I>(args: I) -> Result<ParseResult, String>
@@ -56,6 +58,9 @@ where
         }
         if parsing_options && (arg == "-h" || arg == "--help") {
             return Ok(ParseResult::Help);
+        }
+        if parsing_options && (arg == "-V" || arg == "--version") {
+            return Ok(ParseResult::Version);
         }
         if parsing_options && (arg == "-r" || arg == "--rootfs") {
             let Some(value) = args.next() else {
@@ -248,6 +253,13 @@ mod tests {
             panic!("expected run arguments");
         };
         assert_eq!(args.cwd, PathBuf::from("/workspace"));
+    }
+
+    #[test]
+    fn parses_version_options() {
+        for option in ["-V", "--version"] {
+            assert_eq!(parse(os_args(&[option])).unwrap(), ParseResult::Version);
+        }
     }
 
     #[test]

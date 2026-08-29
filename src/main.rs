@@ -13,6 +13,8 @@ use std::os::unix::process::CommandExt;
 use cli::{ParseResult, HELP};
 use root::{BindSpec, RootView};
 
+const VERSION: &str = include_str!("../VERSION");
+
 // Startup contract: filesystem collection is optional. When a valid invocation
 // discovers before exec that the requested view is unavailable, pathshim must
 // degrade until it can run the original command; the terminal fallback preserves
@@ -26,9 +28,16 @@ fn main() {
         }
     };
 
-    let ParseResult::Run(args) = parsed else {
-        print!("{HELP}");
-        return;
+    let args = match parsed {
+        ParseResult::Run(args) => args,
+        ParseResult::Help => {
+            print!("{HELP}");
+            return;
+        }
+        ParseResult::Version => {
+            println!("pathshim {}", VERSION.trim());
+            return;
+        }
     };
 
     let mut command = Command::new(&args.command);
