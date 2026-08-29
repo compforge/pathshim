@@ -30,9 +30,11 @@ src/
     ├── seccomp.rs      # seccomp user-notification 接口
     └── sysno.rs        # 架构相关 syscall 编号
 tests/
-├── linux_cow.rs        # rootfs/bind、并发视图、静态 Go 与信号 E2E
+├── linux_cow.rs        # rootfs/bind、并发视图、Python/静态 Go 与信号 E2E
 ├── linux_cwd.rs        # guest cwd 与进程语义 E2E
-└── docker_smoke.sh     # 普通非特权容器 smoke test
+├── docker_smoke.sh     # 非特权容器 cow-view/cwd/passthrough smoke test
+├── ffmpeg_smoke.sh     # 调用方提供 ffmpeg 镜像的真实转码 smoke test
+└── capability_audit.sh # 报告未完整映射操作的现场 best-effort 行为
 ```
 
 ## 开发约定
@@ -41,6 +43,7 @@ tests/
 - CLI 与调用契约只表达 source 对应 guest destination 的语义，不把 seccomp、ptrace、FUSE 等机制变成参数或上层概念；README 可以用机制对比解释能力边界和现场要求。
 - 运行日志应说明实际启用的收拢能力和降级原因，避免调用方误判覆盖范围。
 - 文件系统行为测试至少覆盖动态链接程序和静态 Go 程序，并验证根映射与 bind 的读取回退、写入 upper、映射外透传、子进程继承、guest cwd 和重复执行后的持久性；cwd 场景按 PRoot 的测试思路拆成独立 fixture 与集成测试。
+- 正确性 E2E、依赖外部 command/image 的 smoke、以及只报告现场覆盖程度的 capability audit 必须保持不同 verdict，不能把 skip 或已知 lower bypass 描述成通过完整映射。
 
 ## References
 

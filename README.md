@@ -127,15 +127,29 @@ cargo test
 cargo clippy --all-targets -- -D warnings
 ```
 
-Run `cargo test` on Linux to include the COW E2E cases. They cover root and bind projections, mapping-external passthrough, host read fallback, upper writes, merged directories, persistent whiteouts, guest cwd and PWD, `chdir`/`fchdir`/`getcwd`, `/proc/self/cwd`, pthread/fork cwd behavior, metadata copy-up, a static Go command, and Unix signal forwarding.
+Run `cargo test` on Linux to include the COW E2E cases. They cover root and bind projections, mapping-external passthrough, host read fallback, upper writes, merged directories, persistent whiteouts, guest cwd and PWD, `chdir`/`fchdir`/`getcwd`, `/proc/self/cwd`, pthread/fork cwd behavior, metadata copy-up, a static Go command, an installed Python runtime and child process, and Unix signal forwarding. The Python case reports that it was skipped when `python3` is unavailable; a skipped case is not runtime coverage.
 
-Run the Docker smoke test on each target architecture to verify `cow-view` inside an unprivileged container using Docker's default seccomp profile, no added capabilities, a non-root user, and `no-new-privileges`:
+Run the Docker smoke test on each target architecture to verify all three startup modes inside an unprivileged container. It verifies `cow-view` with Docker's default seccomp profile, then denies the `seccomp` syscall and verifies rootfs degradation to `cwd` and bind-only degradation to `passthrough`:
 
 ```console
 ./tests/docker_smoke.sh
 ```
 
-The smoke test requires Docker, Go, and a Rust toolchain. It builds static pathshim and Go fixture binaries, imports a temporary scratch image, verifies that the fixture's write is collected under rootfs, and removes its image and temporary files when finished.
+The smoke test requires Docker, Go, and a Rust toolchain. It builds static pathshim and Go fixture binaries, imports a temporary scratch image, runs with no added capabilities, a non-root user and `no-new-privileges`, and removes its image and temporary files when finished.
+
+Use an existing architecture-compatible image containing `ffmpeg` and `ffprobe` to run the optional real-command smoke test. The script does not pull an image or install packages:
+
+```console
+PATHSHIM_FFMPEG_IMAGE=<image> ./tests/ffmpeg_smoke.sh
+```
+
+This generates a short WAV fixture, runs ffmpeg through pathshim in an unprivileged container, verifies lower input fallback and upper output collection, and validates the output duration with ffprobe.
+
+Run the Linux capability audit when evaluating a target node. It reports whether a best-effort operation is currently projected or bypasses to the lower filesystem; the report is evidence, not a claim of complete syscall coverage:
+
+```console
+./tests/capability_audit.sh
+```
 
 ## License
 

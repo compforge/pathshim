@@ -273,6 +273,59 @@ fn static_go_program_uses_the_same_cow_view() {
 }
 
 #[test]
+fn python_program_and_child_share_the_same_bind_view() {
+    if Command::new("python3").arg("--version").output().is_err() {
+        eprintln!("skipping Python coverage: python3 is not installed");
+        return;
+    }
+
+    let paths = TestPaths::new();
+    let bind_upper = paths.base.join("python-bind-upper");
+    fs::write(paths.lower.join("input.txt"), "python-lower\n").unwrap();
+    let code = r#"
+from pathlib import Path
+import subprocess
+import sys
+
+destination = Path(sys.argv[1])
+print((destination / "input.txt").read_text().strip())
+(destination / "parent.txt").write_text("parent")
+subprocess.run(
+    [
+        sys.executable,
+        "-c",
+        "from pathlib import Path; import sys; Path(sys.argv[1]).write_text('child')",
+        str(destination / "child.txt"),
+    ],
+    check=True,
+)
+"#;
+
+    let output = run_pathshim_bind(
+        &bind_upper,
+        &paths.lower,
+        "python3",
+        &["-c", code, paths.lower.to_str().unwrap()],
+    );
+    assert!(
+        output.status.success(),
+        "Python bind run: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"python-lower\n");
+    assert_eq!(
+        fs::read_to_string(bind_upper.join("parent.txt")).unwrap(),
+        "parent"
+    );
+    assert_eq!(
+        fs::read_to_string(bind_upper.join("child.txt")).unwrap(),
+        "child"
+    );
+    assert!(!paths.lower.join("parent.txt").exists());
+    assert!(!paths.lower.join("child.txt").exists());
+}
+
+#[test]
 fn inherits_callers_process_group_and_forwards_termination_signal() {
     let paths = TestPaths::new();
     let mut child = Command::new(env!("CARGO_BIN_EXE_pathshim"))
