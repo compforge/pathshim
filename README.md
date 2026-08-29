@@ -83,7 +83,7 @@ The Linux backend currently projects common operations used by shells and applic
 - guest `chdir`, `fchdir`, relative path resolution, `getcwd`, and `/proc/self/cwd`;
 - the common cwd inheritance model: pthreads share cwd state, while a forked process receives independent state when it changes cwd;
 - path-based truncate, ownership, permission, and timestamp updates; and
-- signal forwarding from pathshim to the command process group.
+- caller process-group inheritance and direct signal forwarding from pathshim to the command.
 
 The projection works below the language runtime, so it covers both dynamically linked programs and static Go binaries for the supported operations.
 

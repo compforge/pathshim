@@ -139,7 +139,7 @@ fn static_go_program_uses_the_same_cow_view() {
 }
 
 #[test]
-fn forwards_termination_signal_to_the_command_process_group() {
+fn inherits_callers_process_group_and_forwards_termination_signal() {
     let paths = TestPaths::new();
     let mut child = Command::new(env!("CARGO_BIN_EXE_pathshim"))
         .arg("--rootfs")
@@ -148,17 +148,24 @@ fn forwards_termination_signal_to_the_command_process_group() {
             "--",
             "/bin/sh",
             "-c",
-            "trap 'exit 42' TERM; echo ready; while :; do sleep 1; done",
+            "trap 'exit 42' TERM; echo $$; while :; do sleep 1; done",
         ])
         .stdout(Stdio::piped())
         .spawn()
         .expect("start pathshim");
     let stdout = child.stdout.take().expect("capture stdout");
-    let mut ready = String::new();
+    let mut command_pid = String::new();
     BufReader::new(stdout)
-        .read_line(&mut ready)
-        .expect("read child readiness");
-    assert_eq!(ready, "ready\n");
+        .read_line(&mut command_pid)
+        .expect("read command pid");
+    let command_pid = command_pid
+        .trim()
+        .parse::<i32>()
+        .expect("parse command pid");
+    let pathshim_pgid = unsafe { libc::getpgid(child.id() as i32) };
+    let command_pgid = unsafe { libc::getpgid(command_pid) };
+    assert!(pathshim_pgid > 0, "get pathshim pgid");
+    assert_eq!(command_pgid, pathshim_pgid);
 
     assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGTERM) }, 0);
     let status = child.wait().expect("wait for pathshim");

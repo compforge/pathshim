@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use crate::root::{DirEntry, RootView};
 
-static CHILD_PROCESS_GROUP: AtomicI32 = AtomicI32::new(0);
+static CHILD_PROCESS: AtomicI32 = AtomicI32::new(0);
 const FORWARDED_SIGNALS: [i32; 4] = [libc::SIGTERM, libc::SIGINT, libc::SIGHUP, libc::SIGQUIT];
 const PROBE_TIMEOUT_MS: i32 = 5_000;
 const SETUP_READY: u8 = 1;
@@ -84,7 +84,9 @@ pub(crate) fn run(root: RootView, mut command: Command) -> io::Result<RunOutcome
     }
     if pid == 0 {
         drop(parent_socket);
-        unsafe { libc::setpgid(0, 0) };
+        // The caller owns the execution process group. Fork and exec preserve
+        // that PGID; creating a nested group here would let the command escape
+        // a supervisor that kills pathshim's group as one execution.
         child_main(child_socket, &mut command);
     }
     drop(child_socket);
@@ -212,8 +214,8 @@ struct SignalForwarding {
 }
 
 impl SignalForwarding {
-    fn install(child_process_group: i32) -> io::Result<Self> {
-        CHILD_PROCESS_GROUP.store(child_process_group, Ordering::Release);
+    fn install(child_process: i32) -> io::Result<Self> {
+        CHILD_PROCESS.store(child_process, Ordering::Release);
         let mut previous = Vec::with_capacity(FORWARDED_SIGNALS.len());
         for signal in FORWARDED_SIGNALS {
             let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
@@ -226,7 +228,7 @@ impl SignalForwarding {
                         libc::sigaction(*installed_signal, installed_action, std::ptr::null_mut())
                     };
                 }
-                CHILD_PROCESS_GROUP.store(0, Ordering::Release);
+                CHILD_PROCESS.store(0, Ordering::Release);
                 return Err(io::Error::last_os_error());
             }
             previous.push((signal, old));
@@ -237,7 +239,7 @@ impl SignalForwarding {
 
 impl Drop for SignalForwarding {
     fn drop(&mut self) {
-        CHILD_PROCESS_GROUP.store(0, Ordering::Release);
+        CHILD_PROCESS.store(0, Ordering::Release);
         for (signal, action) in self.previous.iter().rev() {
             unsafe { libc::sigaction(*signal, action, std::ptr::null_mut()) };
         }
@@ -245,9 +247,9 @@ impl Drop for SignalForwarding {
 }
 
 extern "C" fn forward_signal(signal: i32) {
-    let process_group = CHILD_PROCESS_GROUP.load(Ordering::Acquire);
-    if process_group > 0 {
-        unsafe { libc::kill(-process_group, signal) };
+    let child = CHILD_PROCESS.load(Ordering::Acquire);
+    if child > 0 {
+        unsafe { libc::kill(child, signal) };
     }
 }
 
