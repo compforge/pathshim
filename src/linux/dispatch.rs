@@ -140,7 +140,7 @@ fn handle_open(listener: RawFd, state: &mut State, notif: &SeccompNotif) -> io::
     {
         if let Ok(entries) = state.root.list_dir(&virtual_path) {
             state.directories.insert(
-                (notif.pid, child_fd),
+                (remote::process_key(notif.pid), child_fd),
                 OpenDirectory {
                     path: virtual_path,
                     entries,
@@ -384,6 +384,17 @@ fn handle_readlink(listener: RawFd, state: &mut State, notif: &SeccompNotif) -> 
         Ok(path) => path,
         Err(error) => return respond_error(listener, notif.id, errno(&error)),
     };
+    if remote::is_own_proc_cwd(&virtual_path, notif.pid) {
+        let Some(target) = remote::virtual_cwd(state, notif.pid) else {
+            return respond_continue(listener, notif.id);
+        };
+        let bytes = target.as_os_str().as_bytes();
+        let length = size.min(bytes.len());
+        return match remote::write_memory(notif.pid, buffer, &bytes[..length]) {
+            Ok(()) => respond_value(listener, notif.id, length as i64),
+            Err(error) => respond_error(listener, notif.id, errno(&error)),
+        };
+    }
     if passthrough(&virtual_path) {
         return respond_continue(listener, notif.id);
     }
@@ -428,7 +439,10 @@ fn handle_getdents(listener: RawFd, state: &mut State, notif: &SeccompNotif) -> 
     let fd = notif.data.args[0] as i32;
     let buffer = notif.data.args[1];
     let capacity = notif.data.args[2] as usize;
-    let Some(directory) = state.directories.get_mut(&(notif.pid, fd)) else {
+    let Some(directory) = state
+        .directories
+        .get_mut(&(remote::process_key(notif.pid), fd))
+    else {
         return respond_continue(listener, notif.id);
     };
     let mut output = Vec::with_capacity(capacity.min(8192));
@@ -459,7 +473,7 @@ fn handle_chdir(listener: RawFd, state: &mut State, notif: &SeccompNotif) -> io:
         }
     } else {
         let fd = notif.data.args[0] as i32;
-        if let Some(directory) = state.directories.get(&(notif.pid, fd)) {
+        if let Some(directory) = state.directories.get(&(remote::process_key(notif.pid), fd)) {
             directory.path.clone()
         } else {
             return respond_continue(listener, notif.id);
@@ -467,7 +481,9 @@ fn handle_chdir(listener: RawFd, state: &mut State, notif: &SeccompNotif) -> io:
     };
 
     if passthrough(&virtual_path) {
-        state.virtual_cwds.insert(notif.pid, virtual_path);
+        state
+            .virtual_cwds
+            .insert(remote::process_key(notif.pid), virtual_path);
         return respond_continue(listener, notif.id);
     }
     let real_path = match state.root.resolve_read(&virtual_path) {
@@ -479,7 +495,13 @@ fn handle_chdir(listener: RawFd, state: &mut State, notif: &SeccompNotif) -> io:
         Ok(_) => return respond_error(listener, notif.id, libc::ENOTDIR),
         Err(error) => return respond_error(listener, notif.id, errno(&error)),
     }
-    state.virtual_cwds.insert(notif.pid, virtual_path.clone());
+    // pthreads share cwd through CLONE_FS. The filesystem notification stream
+    // has no clone lifecycle event or child pid to correlate with clone flags,
+    // so the thread-group id is the closest stable shared key; a separate
+    // process receives its own key when it first changes cwd.
+    state
+        .virtual_cwds
+        .insert(remote::process_key(notif.pid), virtual_path.clone());
 
     // Let the kernel maintain cwd when the visible path is the host path. Upper-only
     // directories cannot be entered in the tracee's mount view, so emulate chdir and

@@ -62,7 +62,7 @@ pub(crate) fn resolve_path(
     }
     let base = if dirfd == libc::AT_FDCWD {
         virtual_cwd(state, pid).unwrap_or_else(|| process_cwd(pid, state))
-    } else if let Some(directory) = state.directories.get(&(pid, dirfd)) {
+    } else if let Some(directory) = state.directories.get(&(process_key(pid), dirfd)) {
         directory.path.clone()
     } else {
         let host = std::fs::read_link(format!("/proc/{pid}/fd/{dirfd}"))?;
@@ -72,7 +72,7 @@ pub(crate) fn resolve_path(
 }
 
 pub(crate) fn virtual_cwd(state: &State, pid: u32) -> Option<PathBuf> {
-    let mut current = pid;
+    let mut current = process_key(pid);
     for _ in 0..16 {
         if let Some(path) = state.virtual_cwds.get(&current) {
             return Some(path.clone());
@@ -81,9 +81,30 @@ pub(crate) fn virtual_cwd(state: &State, pid: u32) -> Option<PathBuf> {
         if parent == 0 || parent == current {
             break;
         }
-        current = parent;
+        current = process_key(parent);
     }
     None
+}
+
+pub(crate) fn process_key(pid: u32) -> u32 {
+    process_status_field(pid, "Tgid:").unwrap_or(pid)
+}
+
+pub(crate) fn is_own_proc_cwd(path: &Path, pid: u32) -> bool {
+    if path == Path::new("/proc/self/cwd") || path == Path::new("/proc/thread-self/cwd") {
+        return true;
+    }
+    let Some(target) = path
+        .strip_prefix("/proc")
+        .ok()
+        .and_then(|path| path.components().next())
+        .and_then(|component| component.as_os_str().to_str())
+        .and_then(|value| value.parse::<u32>().ok())
+    else {
+        return false;
+    };
+    path == Path::new(&format!("/proc/{target}/cwd"))
+        && (target == pid || target == process_key(pid))
 }
 
 fn read_memory(pid: u32, address: u64, length: usize) -> io::Result<Vec<u8>> {
@@ -111,10 +132,14 @@ fn process_cwd(pid: u32, state: &State) -> PathBuf {
 }
 
 fn process_parent(pid: u32) -> Option<u32> {
+    process_status_field(pid, "PPid:")
+}
+
+fn process_status_field(pid: u32, name: &str) -> Option<u32> {
     let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
     status
         .lines()
-        .find_map(|line| line.strip_prefix("PPid:"))?
+        .find_map(|line| line.strip_prefix(name))?
         .trim()
         .parse()
         .ok()

@@ -5,6 +5,7 @@
 ```console
 pathshim -r <path> <command> [args...]
 pathshim --rootfs=<path> <command> [args...]
+pathshim -r <path> --cwd <guest-path> <command> [args...]
 ```
 
 Within the supported filesystem operations:
@@ -15,7 +16,7 @@ Within the supported filesystem operations:
 - Deleting a host-only path records a persistent whiteout under `<path>/.pathshim/`; it does not delete the host path.
 - Executables and runtime libraries can still come from the host, so rootfs does not need to contain a complete filesystem tree.
 
-`pathshim` is a best-effort COW chroot alternative built on seccomp user notification, without `ptrace` or mount namespaces. It is a collection tool, not a security boundary or an equivalent replacement for kernel `chroot` or PRoot.
+`pathshim` pursues the same product goal as PRoot: give an unprivileged process a guest root filesystem view. It uses seccomp user notification instead of `ptrace` or mount namespaces and deliberately accepts degraded, best-effort coverage. It is a collection tool, not a security boundary or a feature-equivalent replacement for kernel `chroot` or PRoot.
 
 ## How it relates to chroot and PRoot
 
@@ -25,15 +26,16 @@ Within the supported filesystem operations:
 | PRoot | `ptrace` observes syscalls and translates paths between guest and host rootfs. | Broad userspace chroot emulation, with `ptrace` availability and tracing overhead. |
 | pathshim | Seccomp user notification delegates selected filesystem syscalls to a supervisor, which applies host-read-fallback and COW writes to rootfs. | Deliberately incomplete projection that degrades instead of preventing command startup. |
 
+Use `-w`, `--cwd`, or `--pwd` to select the initial working directory inside the guest view. The default is `/`. The path is normalized and checked against the merged upper/lower view. A missing directory is created in the writable upper; a non-directory path or creation failure emits a warning and falls back to `/`.
+
 ## Example
 
 ```console
 cargo build --release
+mkdir -p /var/lib/pathshim/session-1/project
 
-./target/release/pathshim -r /var/lib/pathshim/session-1 /bin/sh -c '
+./target/release/pathshim -r /var/lib/pathshim/session-1 -w /project /bin/sh -c '
   cat /etc/os-release
-  mkdir /project
-  cd /project
   echo hello > result.txt
 '
 ```
@@ -78,7 +80,8 @@ The Linux backend currently projects common operations used by shells and applic
 - stat and access checks;
 - directory creation, removal, rename, and merged directory listing;
 - symlink creation and reading;
-- virtual `chdir`, relative path resolution, and `getcwd`;
+- guest `chdir`, `fchdir`, relative path resolution, `getcwd`, and `/proc/self/cwd`;
+- the common cwd inheritance model: pthreads share cwd state, while a forked process receives independent state when it changes cwd;
 - path-based truncate, ownership, permission, and timestamp updates; and
 - signal forwarding from pathshim to the command process group.
 
@@ -88,6 +91,8 @@ The projection works below the language runtime, so it covers both dynamically l
 
 - Filesystem syscall coverage is intentionally incomplete. Operations such as hard-link creation, device/FIFO creation, `io_uring`-based file access, and executing a binary that exists only under rootfs are not projected yet.
 - `/dev`, `/proc`, and `/sys` retain host/container semantics and are passed through.
+- Self cwd links are projected, but the rest of `/proc` keeps host/container semantics.
+- The current filesystem notification stream has no clone lifecycle event that correlates clone flags with the new child pid. Exact sharing for arbitrary `clone(CLONE_FS)` users and an exact fork-time cwd snapshot are best effort; ordinary pthread and fork flows are covered.
 - An unsupported operation may observe or modify the host/container filesystem. Do not use pathshim to run untrusted code or to enforce a read-only lower layer.
 - Kernel and security-profile behavior varies across Kubernetes runtimes. Run the included Linux E2E tests on the target node image before adopting pathshim.
 - Automated runtime E2E coverage currently runs on Linux x86_64. The Linux E2E suite and Docker smoke test have also been exercised manually on aarch64, but aarch64 still needs automated runtime CI coverage.
@@ -102,7 +107,7 @@ cargo test
 cargo clippy --all-targets -- -D warnings
 ```
 
-Run `cargo test` on Linux to include the COW E2E cases. They cover host read fallback, upper writes, merged directories, persistent whiteouts, virtual cwd, metadata copy-up, a static Go command, and Unix signal forwarding.
+Run `cargo test` on Linux to include the COW E2E cases. They cover host read fallback, upper writes, merged directories, persistent whiteouts, guest cwd and PWD, `chdir`/`fchdir`/`getcwd`, `/proc/self/cwd`, pthread/fork cwd behavior, metadata copy-up, a static Go command, and Unix signal forwarding.
 
 Run the Docker smoke test on each target architecture to verify `cow-root` inside an unprivileged container using Docker's default seccomp profile, no added capabilities, a non-root user, and `no-new-privileges`:
 
