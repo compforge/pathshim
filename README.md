@@ -90,7 +90,7 @@ The projection works below the language runtime, so it covers both dynamically l
 - `/dev`, `/proc`, and `/sys` retain host/container semantics and are passed through.
 - An unsupported operation may observe or modify the host/container filesystem. Do not use pathshim to run untrusted code or to enforce a read-only lower layer.
 - Kernel and security-profile behavior varies across Kubernetes runtimes. Run the included Linux E2E tests on the target node image before adopting pathshim.
-- Runtime E2E coverage currently runs on Linux x86_64. The aarch64 target is compile-checked but still needs runtime CI coverage.
+- Automated runtime E2E coverage currently runs on Linux x86_64. The Linux E2E suite and Docker smoke test have also been exercised manually on aarch64, but aarch64 still needs automated runtime CI coverage.
 
 ## Development
 
@@ -103,6 +103,14 @@ cargo clippy --all-targets -- -D warnings
 ```
 
 Run `cargo test` on Linux to include the COW E2E cases. They cover host read fallback, upper writes, merged directories, persistent whiteouts, virtual cwd, metadata copy-up, a static Go command, and Unix signal forwarding.
+
+Run the Docker smoke test on each target architecture to verify `cow-root` inside an unprivileged container using Docker's default seccomp profile, no added capabilities, a non-root user, and `no-new-privileges`:
+
+```console
+./tests/docker_smoke.sh
+```
+
+The smoke test requires Docker, Go, and a Rust toolchain. It builds static pathshim and Go fixture binaries, imports a temporary scratch image, verifies that the fixture's write is collected under rootfs, and removes its image and temporary files when finished.
 
 ## License
 
