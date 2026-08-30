@@ -47,6 +47,8 @@ pathshim 基于现场行为探测选择模式，不维护发行版或内核版�
 
 模式选择只发生在 command `exec` 之前；command 启动后不能通过重启切换模式，否则可能重复副作用。
 
+`pathshim probe --bind SOURCE:DEST` 复用第 2～5 步的真实握手与 Projection 探测，但只执行 pathshim 自身的内部零副作用 child，不接受或启动用户 command。`bind-view` 对应退出码 0，正常运行将降级时返回 `passthrough` 与退出码 1，参数错误仍返回 2；常驻 caller 可据此在启动时决定是否启用 pathshim。
+
 ## 路径与并发
 
 以 `--bind /var/lib/run/workspace:/workspace` 为例：

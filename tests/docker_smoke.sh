@@ -57,6 +57,42 @@ assert_mode() {
   esac
 }
 
+assert_probe_mode() {
+  local log=$1
+  local expected=$2
+  case "$(<"$log")" in
+    *"probe mode=$expected"*) ;;
+    *)
+      echo "expected probe mode $expected, got:" >&2
+      cat "$log" >&2
+      return 1
+      ;;
+  esac
+}
+
+probe_output=$("${docker_run[@]}" \
+  --volume "$run_dir/bind-source:/source" \
+  --volume "$run_dir/bind-destination:/guest" \
+  "$image" \
+  /pathshim probe --bind /source:/guest \
+  2>"$run_dir/probe-bind.stderr")
+test "$probe_output" = "bind-view"
+test ! -s "$run_dir/probe-bind.stderr"
+
+set +e
+probe_passthrough_output=$("${docker_run[@]}" \
+  --security-opt "seccomp=$deny_profile" \
+  --volume "$run_dir/passthrough-source:/source" \
+  --volume "$run_dir/passthrough-destination:/guest" \
+  "$image" \
+  /pathshim probe --bind /source:/guest \
+  2>"$run_dir/probe-passthrough.stderr")
+probe_passthrough_status=$?
+set -e
+test "$probe_passthrough_status" -eq 1
+test "$probe_passthrough_output" = "passthrough"
+assert_probe_mode "$run_dir/probe-passthrough.stderr" passthrough
+
 bind_output=$("${docker_run[@]}" \
   --volume "$run_dir/bind-source:/source" \
   --volume "$run_dir/bind-destination:/guest" \
@@ -82,4 +118,4 @@ test ! -e "$run_dir/passthrough-source/passthrough-output"
 test "$passthrough_output" = "$(cat "$run_dir/passthrough-destination/passthrough-output")"
 assert_mode "$run_dir/passthrough.stderr" passthrough
 
-printf 'pathshim Docker smoke passed: arch=%s modes=bind-view,passthrough\n' "$(uname -m)"
+printf 'pathshim Docker smoke passed: arch=%s modes=bind-view,passthrough probe=verified\n' "$(uname -m)"
