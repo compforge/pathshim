@@ -39,6 +39,30 @@ impl Drop for TestPaths {
 }
 
 #[test]
+fn probe_reports_bind_view_without_running_a_user_command() {
+    let paths = TestPaths::new();
+    let output = Command::new(env!("CARGO_BIN_EXE_pathshim"))
+        .arg("probe")
+        .arg("--bind")
+        .arg(format!(
+            "{}:{}",
+            paths.source.display(),
+            paths.destination.display()
+        ))
+        .output()
+        .expect("run pathshim probe");
+
+    assert!(
+        output.status.success(),
+        "pathshim probe: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"bind-view\n");
+    assert!(output.stderr.is_empty());
+    assert!(fs::read_dir(&paths.source).unwrap().next().is_none());
+}
+
+#[test]
 fn bind_replaces_selected_subtree_and_leaves_outside_paths_alone() {
     let paths = TestPaths::new();
     fs::write(paths.source.join("input.txt"), "source\n").unwrap();

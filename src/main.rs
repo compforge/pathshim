@@ -14,12 +14,17 @@ use bind::{BindSpec, BindView};
 use cli::{ParseResult, HELP};
 
 const VERSION: &str = include_str!("../VERSION");
+const PROBE_CHILD_ARG: &str = "__pathshim_probe_child";
 
 // Startup contract: path mapping is optional. When a valid invocation cannot
 // install its bind view before exec, the original command still starts with its
 // inherited environment and caller working directory.
 fn main() {
-    let parsed = match cli::parse(env::args_os().skip(1)) {
+    let raw_args: Vec<_> = env::args_os().skip(1).collect();
+    if raw_args.len() == 1 && raw_args[0] == PROBE_CHILD_ARG {
+        return;
+    }
+    let parsed = match cli::parse(raw_args) {
         Ok(parsed) => parsed,
         Err(error) => {
             eprintln!("pathshim: {error}\n\n{HELP}");
@@ -37,18 +42,12 @@ fn main() {
             println!("pathshim {}", VERSION.trim());
             return;
         }
+        ParseResult::Probe(args) => probe(bind_specs(args.binds)),
     };
 
     let mut command = Command::new(&args.command);
     command.args(&args.args);
-    let binds: Vec<_> = args
-        .binds
-        .into_iter()
-        .map(|bind| BindSpec {
-            source: bind.source,
-            destination: bind.destination,
-        })
-        .collect();
+    let binds = bind_specs(args.binds);
     let view = match BindView::open(&binds) {
         Ok(view) => view,
         Err(error) => {
@@ -81,6 +80,61 @@ fn main() {
     configure_virtual_environment(&mut command, &guest_cwd);
 
     run(view, command, args.quiet);
+}
+
+fn bind_specs(binds: Vec<cli::BindArg>) -> Vec<BindSpec> {
+    binds
+        .into_iter()
+        .map(|bind| BindSpec {
+            source: bind.source,
+            destination: bind.destination,
+        })
+        .collect()
+}
+
+fn probe(binds: Vec<BindSpec>) -> ! {
+    let view = match BindView::open(&binds) {
+        Ok(view) => view,
+        Err(error) => probe_unavailable(format!("bind-view-unavailable error={error}")),
+    };
+    probe_view(view)
+}
+
+#[cfg(target_os = "linux")]
+fn probe_view(view: BindView) -> ! {
+    let mut command = Command::new("/proc/self/exe");
+    command.arg(PROBE_CHILD_ARG);
+    match linux::run(view, command, true) {
+        Ok(linux::RunOutcome::Exited(linux::ChildStatus::Exited(0))) => {
+            println!("bind-view");
+            process::exit(0);
+        }
+        Ok(linux::RunOutcome::Unavailable { reason, .. }) => probe_unavailable(reason),
+        Ok(linux::RunOutcome::Exited(status)) => probe_unavailable(format!(
+            "probe-child-failed status={}",
+            display_status(status)
+        )),
+        Err(error) => probe_unavailable(format!("bind-view-probe-failed error={error}")),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn display_status(status: linux::ChildStatus) -> String {
+    match status {
+        linux::ChildStatus::Exited(code) => format!("exit-{code}"),
+        linux::ChildStatus::Signaled(signal) => format!("signal-{signal}"),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn probe_view(_view: BindView) -> ! {
+    probe_unavailable("bind-view-requires-linux".to_owned())
+}
+
+fn probe_unavailable(reason: String) -> ! {
+    println!("passthrough");
+    eprintln!("pathshim: probe mode=passthrough reason={reason}");
+    process::exit(1);
 }
 
 fn diagnostic(quiet: bool, message: String) {

@@ -45,6 +45,7 @@ tests/
 - 不把网络、权限限制和进程治理带入 pathshim；bind path mapping 是唯一职责。
 - CLI 只表达 source、guest destination、cwd 和 command，不把 seccomp 等底层机制暴露成调用方概念。
 - 普通运行输出实际模式和降级原因；集成方可用 `--quiet` 防止诊断混入 command stderr。
+- 常驻集成方使用 `pathshim probe --bind SOURCE:DEST` 做启动期能力探测；probe 必须复用真实 bind-view 握手、不运行用户 command，并通过稳定退出码区分可用与降级。
 - Linux 行为测试至少覆盖动态链接程序、静态 Go 程序、mapped execve/execveat、子进程继承、多个独立 invocation 共享 source、外部 writer、guest cwd、映射外透传和 signal 终态。
 - 正确性 E2E、依赖外部 command/image 的 smoke、以及只报告现场覆盖程度的 capability audit 保持不同 verdict，不能把 skip 或已知 bypass 描述成通过完整映射。
 

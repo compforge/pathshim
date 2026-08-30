@@ -54,6 +54,16 @@ The selected mode and degradation reason are written to stderr. Integrations tha
 
 Command startup takes priority over mapping. Once a command has started, pathshim never restarts it in another mode because doing so could repeat side effects.
 
+### Startup probe
+
+Long-running callers can test the exact bind configuration during startup without running a user command:
+
+```console
+pathshim probe --bind /var/lib/session-probe/workspace:/workspace
+```
+
+The probe performs the same seccomp listener handshake and live Projection checks used before a normal command. It prints `bind-view` and exits `0` when mapping is available; it prints `passthrough` and exits `1` when a normal invocation would degrade, with the reason on stderr. Invalid CLI input exits `2`. The caller owns the probe source directory and may remove it afterward.
+
 ## Kubernetes and Linux requirements
 
 pathshim targets an ordinary Kubernetes Pod. It does not request:

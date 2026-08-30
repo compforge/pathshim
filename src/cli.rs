@@ -7,6 +7,10 @@ Run a command with best-effort bind path mappings.
 Usage:
   pathshim -b <SOURCE:DEST> [-b <SOURCE:DEST> ...] [-w <PATH>] [--] <COMMAND> [ARGS...]
   pathshim --bind=<SOURCE:DEST> [--cwd=<PATH>] [--quiet] [--] <COMMAND> [ARGS...]
+  pathshim probe -b <SOURCE:DEST> [-b <SOURCE:DEST> ...]
+
+Commands:
+  probe                Test whether bind-view works without running a user command
 
 Options:
   -b, --bind <SOURCE:DEST>
@@ -34,13 +38,30 @@ pub(crate) struct BindArg {
 }
 
 #[derive(Debug, Eq, PartialEq)]
+pub(crate) struct ProbeArgs {
+    pub(crate) binds: Vec<BindArg>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
 pub(crate) enum ParseResult {
     Run(RunArgs),
+    Probe(ProbeArgs),
     Help,
     Version,
 }
 
 pub(crate) fn parse<I>(args: I) -> Result<ParseResult, String>
+where
+    I: IntoIterator<Item = OsString>,
+{
+    let args: Vec<_> = args.into_iter().collect();
+    if args.first().is_some_and(|arg| arg == "probe") {
+        return parse_probe(args.into_iter().skip(1));
+    }
+    parse_run(args)
+}
+
+fn parse_run<I>(args: I) -> Result<ParseResult, String>
 where
     I: IntoIterator<Item = OsString>,
 {
@@ -119,6 +140,38 @@ where
         command: executable,
         args: command.collect(),
     }))
+}
+
+fn parse_probe<I>(args: I) -> Result<ParseResult, String>
+where
+    I: IntoIterator<Item = OsString>,
+{
+    let mut args = args.into_iter();
+    let mut binds = Vec::new();
+    while let Some(arg) = args.next() {
+        if arg == "-h" || arg == "--help" {
+            return Ok(ParseResult::Help);
+        }
+        if arg == "-b" || arg == "--bind" {
+            let Some(value) = args.next() else {
+                return Err(format!("`{}` requires SOURCE:DEST", arg.to_string_lossy()));
+            };
+            binds.push(parse_bind(value)?);
+            continue;
+        }
+        if let Some(value) = arg.to_str().and_then(|value| value.strip_prefix("--bind=")) {
+            binds.push(parse_bind(OsString::from(value))?);
+            continue;
+        }
+        return Err(format!(
+            "unexpected probe argument `{}`: only --bind is supported",
+            arg.to_string_lossy()
+        ));
+    }
+    if binds.is_empty() {
+        return Err("probe requires at least one `--bind SOURCE:DEST`".to_owned());
+    }
+    Ok(ParseResult::Probe(ProbeArgs { binds }))
 }
 
 fn parse_bind(value: OsString) -> Result<BindArg, String> {
@@ -224,6 +277,45 @@ mod tests {
         for option in ["-V", "--version"] {
             assert_eq!(parse(os_args(&[option])).unwrap(), ParseResult::Version);
         }
+    }
+
+    #[test]
+    fn parses_probe_with_repeatable_binds() {
+        let result = parse(os_args(&[
+            "probe",
+            "--bind",
+            "/upper/one:/workspace",
+            "--bind=/upper/two:/cache",
+        ]))
+        .unwrap();
+
+        assert_eq!(
+            result,
+            ParseResult::Probe(ProbeArgs {
+                binds: vec![
+                    BindArg {
+                        source: PathBuf::from("/upper/one"),
+                        destination: PathBuf::from("/workspace"),
+                    },
+                    BindArg {
+                        source: PathBuf::from("/upper/two"),
+                        destination: PathBuf::from("/cache"),
+                    },
+                ],
+            })
+        );
+    }
+
+    #[test]
+    fn probe_requires_a_bind_and_rejects_a_command() {
+        assert!(parse(os_args(&["probe"]))
+            .unwrap_err()
+            .contains("requires at least one"));
+        assert!(
+            parse(os_args(&["probe", "--bind", "/upper:/workspace", "true",]))
+                .unwrap_err()
+                .contains("unexpected probe argument")
+        );
     }
 
     #[test]
