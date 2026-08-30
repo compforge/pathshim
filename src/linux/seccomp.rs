@@ -119,6 +119,8 @@ pub(crate) fn add_fd(listener: RawFd, request: &SeccompNotifAddfd) -> io::Result
 
 fn intercepted_syscalls() -> Vec<i64> {
     vec![
+        libc::SYS_execve,
+        libc::SYS_execveat,
         sysno::OPEN,
         libc::SYS_openat,
         libc::SYS_openat2,

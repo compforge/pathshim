@@ -19,6 +19,9 @@ struct OpenHow {
 
 pub(crate) fn handle(listener: RawFd, state: &mut State, notif: SeccompNotif) -> io::Result<()> {
     let syscall = notif.data.nr as i64;
+    if syscall == libc::SYS_execve || syscall == libc::SYS_execveat {
+        return super::execute::handle(listener, state, &notif);
+    }
     if syscall == sysno::OPEN || syscall == libc::SYS_openat || syscall == libc::SYS_openat2 {
         return handle_open(listener, state, &notif);
     }

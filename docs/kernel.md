@@ -41,7 +41,7 @@ pathshim 基于现场行为探测选择模式，不维护发行版或内核版�
 2. BindView 创建 source、规范化 destination、拒绝重复或保留路径，并按 destination 长度排列 Projection。
 3. 主流程解析初始 cwd；映射内目录缺失时在 source 创建，无法使用时回退 guest `/`。
 4. Linux child 安装 seccomp user-notification filter，把 listener fd 交给 parent；parent 启动 filesystem supervisor，双方在 command `exec` 前完成握手和真实映射探测。
-5. 探测成功后进入 `bind-view`。受支持 syscall 由 `dispatch` 解析 guest 路径，通过 BindView 选择 source 路径，再由 supervisor 执行或向 child 注入 fd。
+5. 探测成功后进入 `bind-view`。受支持 filesystem syscall 由 `dispatch` 解析 guest 路径；`execve`/`execveat` 由 `execute` 打开 source executable、向 child 注入 close-on-exec fd，并通过短 `/dev/fd` 路径继续原 syscall。
 6. command 执行前发现映射不可用时进入 `passthrough`，重建原 command 以清除 guest cwd 和 `PWD`。
 7. parent 等待 command 终态，停止 filesystem supervisor，并把 exit code 或 signal 原样返回 caller。
 
@@ -76,7 +76,7 @@ pathshim 不充当 PID 1、subreaper 或 tini。不可捕获信号和整棵进�
 ## 能力边界
 
 - pathshim 不是安全边界；未覆盖 syscall 可能访问 Pod 原始 destination。
-- 当前不完整覆盖 hard link、设备/FIFO、extended attributes、`io_uring` 文件访问，以及只存在于 source 的 guest 绝对 executable path。
+- 当前不完整覆盖 hard link、设备/FIFO、extended attributes 和 `io_uring` 文件访问。映射后的绝对执行当前面向 readable ELF；execute-only 文件与 shebang 脚本仍是 best effort 边界。
 - seccomp user notification、进程内存访问或 fd 注入不可用时进入 passthrough，不要求 caller 修改 Pod 权限。
 - `--quiet` 只抑制能力和降级诊断，不能吞掉无效参数或无法执行 command 等调用错误。
 - guest cwd 覆盖常见 pthread/fork；任意 `clone(CLONE_FS)` 组合仍是 best effort。
@@ -87,5 +87,6 @@ pathshim 不充当 PID 1、subreaper 或 tini。不可捕获信号和整棵进�
 - [`src/bind.rs`](../src/bind.rs)：Projection、BindView 与双向路径选择。
 - [`src/linux/mod.rs`](../src/linux/mod.rs)：child、listener、supervisor、能力探测和进程终态。
 - [`src/linux/dispatch.rs`](../src/linux/dispatch.rs)：受支持 syscall 的 guest 语义。
+- [`src/linux/execute.rs`](../src/linux/execute.rs)：映射 `execve`/`execveat` 的 executable fd 与 pathname。
 - [`src/linux/seccomp.rs`](../src/linux/seccomp.rs)：通知 filter 与内核接口。
 - [`src/linux/remote.rs`](../src/linux/remote.rs)：读取 tracee 参数、cwd 和 fd 状态。

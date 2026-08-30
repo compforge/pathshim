@@ -1,4 +1,5 @@
 mod dispatch;
+mod execute;
 mod remote;
 mod seccomp;
 mod sysno;
@@ -187,7 +188,7 @@ pub(crate) fn run(view: BindView, mut command: Command, quiet: bool) -> io::Resu
 
     if !quiet {
         eprintln!(
-            "pathshim: collect mode=bind-view projections={} features=replace,shared-source",
+            "pathshim: collect mode=bind-view projections={} features=replace,shared-source,mapped-exec",
             view.projection_count()
         );
     }

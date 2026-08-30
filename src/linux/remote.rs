@@ -1,6 +1,8 @@
 use std::ffi::OsString;
+use std::fs::OpenOptions;
 use std::io;
-use std::os::unix::ffi::OsStringExt;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::os::unix::fs::FileExt;
 use std::path::{Component, Path, PathBuf};
 
 use super::State;
@@ -48,6 +50,41 @@ pub(crate) fn write_memory(pid: u32, address: u64, bytes: &[u8]) -> io::Result<(
         ))
     } else {
         Ok(())
+    }
+}
+
+pub(crate) fn rewrite_path(
+    pid: u32,
+    address: u64,
+    original: &Path,
+    replacement: &Path,
+) -> io::Result<()> {
+    let mut bytes = replacement.as_os_str().as_bytes().to_vec();
+    bytes.push(0);
+    if bytes.len() > original.as_os_str().as_bytes().len() + 1 {
+        return Err(io::Error::from_raw_os_error(libc::ENAMETOOLONG));
+    }
+    match write_memory(pid, address, &bytes) {
+        Ok(()) => Ok(()),
+        Err(_) => write_process_memory(pid, address, &bytes),
+    }
+}
+
+fn write_process_memory(pid: u32, address: u64, bytes: &[u8]) -> io::Result<()> {
+    // process_vm_writev honors the tracee page's write bit, while an exec
+    // pathname may live in read-only program data. /proc/pid/mem provides the
+    // same parent-child access boundary but can update that private mapping.
+    let memory = OpenOptions::new()
+        .write(true)
+        .open(format!("/proc/{pid}/mem"))?;
+    let written = memory.write_at(bytes, address)?;
+    if written == bytes.len() {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::WriteZero,
+            "short /proc/pid/mem write",
+        ))
     }
 }
 

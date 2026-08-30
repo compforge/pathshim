@@ -155,19 +155,7 @@ fn static_go_program_uses_the_bind_view() {
 
     let paths = TestPaths::new();
     let binary = paths.base.join("static-go");
-    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/static_go.go");
-    let build = Command::new("go")
-        .env("CGO_ENABLED", "0")
-        .args(["build", "-o"])
-        .arg(&binary)
-        .arg(source)
-        .output()
-        .expect("build static Go fixture");
-    assert!(
-        build.status.success(),
-        "go build: {}",
-        String::from_utf8_lossy(&build.stderr)
-    );
+    build_static_go(&binary);
 
     let output = Command::new(env!("CARGO_BIN_EXE_pathshim"))
         .arg("--bind")
@@ -184,6 +172,122 @@ fn static_go_program_uses_the_bind_view() {
     );
     assert_eq!(
         fs::read(paths.source.join("go-output")).unwrap(),
+        output.stdout
+    );
+}
+
+#[test]
+fn initial_command_executes_elf_from_bind_source() {
+    if Command::new("go").arg("version").output().is_err() {
+        eprintln!("skipping mapped executable coverage: go is not installed");
+        return;
+    }
+
+    let paths = TestPaths::new();
+    let binary = paths.source.join("app");
+    build_static_go(&binary);
+    let executable = paths.destination.join("app");
+    let output_path = paths.destination.join("initial-exec-output");
+
+    let output = run_pathshim(
+        &paths,
+        executable.to_str().unwrap(),
+        &[output_path.to_str().unwrap()],
+    );
+
+    assert!(
+        output.status.success(),
+        "mapped initial exec: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read(paths.source.join("initial-exec-output")).unwrap(),
+        output.stdout
+    );
+}
+
+#[test]
+fn mapped_exec_does_not_fall_back_to_destination() {
+    let paths = TestPaths::new();
+    let executable = paths.destination.join("destination-only-app");
+    fs::copy("/bin/true", &executable).expect("create destination executable fixture");
+
+    let output = run_pathshim(&paths, executable.to_str().unwrap(), &[]);
+
+    assert!(!output.status.success());
+    assert!(!paths.source.join("destination-only-app").exists());
+}
+
+#[test]
+fn command_builds_and_executes_elf_through_bind() {
+    if Command::new("go").arg("version").output().is_err() {
+        eprintln!("skipping build-and-exec coverage: go is not installed");
+        return;
+    }
+
+    let paths = TestPaths::new();
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/static_go.go");
+    let executable = paths.destination.join("built-app");
+    let output_path = paths.destination.join("built-exec-output");
+    let script = format!(
+        "CGO_ENABLED=0 go build -o {executable} {fixture} && {executable} {output_path}",
+        executable = executable.display(),
+        fixture = fixture.display(),
+        output_path = output_path.display(),
+    );
+
+    let output = run_pathshim(&paths, "/bin/sh", &["-c", &script]);
+
+    assert!(
+        output.status.success(),
+        "mapped descendant exec: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read(paths.source.join("built-exec-output")).unwrap(),
+        output.stdout
+    );
+}
+
+#[test]
+fn execveat_executes_elf_from_bind_source() {
+    if Command::new("go").arg("version").output().is_err() {
+        eprintln!("skipping execveat coverage: go is not installed");
+        return;
+    }
+
+    let paths = TestPaths::new();
+    build_static_go(&paths.source.join("app"));
+    let launcher = paths.base.join("execveat-launcher");
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/execveat.c");
+    let build = Command::new("cc")
+        .args(["-std=c11", "-Wall", "-Wextra", "-Werror"])
+        .arg(fixture)
+        .arg("-o")
+        .arg(&launcher)
+        .output()
+        .expect("compile execveat fixture");
+    assert!(
+        build.status.success(),
+        "cc: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_pathshim"))
+        .arg("--bind")
+        .arg(format!("{}:/workspace", paths.source.display()))
+        .arg("--")
+        .arg(launcher)
+        .output()
+        .expect("run execveat fixture");
+
+    assert!(
+        output.status.success(),
+        "mapped execveat: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read(paths.source.join("execveat-output")).unwrap(),
         output.stdout
     );
 }
@@ -314,6 +418,22 @@ fn spawn_pathshim(paths: &TestPaths, executable: &str, args: &[&str]) -> Child {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn pathshim")
+}
+
+fn build_static_go(binary: &Path) {
+    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/static_go.go");
+    let build = Command::new("go")
+        .env("CGO_ENABLED", "0")
+        .args(["build", "-o"])
+        .arg(binary)
+        .arg(source)
+        .output()
+        .expect("build static Go fixture");
+    assert!(
+        build.status.success(),
+        "go build: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
 }
 
 fn wait_until_exists(path: &Path) {
