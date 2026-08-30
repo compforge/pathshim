@@ -103,10 +103,10 @@ fn handle_open(listener: RawFd, state: &mut State, notif: &SeccompNotif) -> io::
         Ok(path) => path,
         Err(error) => return respond_error(listener, notif.id, errno(&error)),
     };
-    if !state.root.projects(&virtual_path) {
+    if !state.view.projects(&virtual_path) {
         return respond_continue(listener, notif.id);
     }
-    let real_path = match state.root.prepare_open(&virtual_path, flags) {
+    let real_path = match state.view.prepare_open(&virtual_path, flags) {
         Ok(path) => path,
         Err(error) => return respond_error(listener, notif.id, errno(&error)),
     };
@@ -138,7 +138,7 @@ fn handle_open(listener: RawFd, state: &mut State, notif: &SeccompNotif) -> io::
             .map(|metadata| metadata.is_dir())
             .unwrap_or(false)
     {
-        if let Ok(entries) = state.root.list_dir(&virtual_path) {
+        if let Ok(entries) = state.view.list_dir(&virtual_path) {
             state.directories.insert(
                 (remote::process_key(notif.pid), child_fd),
                 OpenDirectory {
@@ -165,10 +165,10 @@ fn handle_stat(listener: RawFd, state: &mut State, notif: &SeccompNotif) -> io::
         Ok(path) => path,
         Err(error) => return respond_error(listener, notif.id, errno(&error)),
     };
-    if !state.root.projects(&virtual_path) {
+    if !state.view.projects(&virtual_path) {
         return respond_continue(listener, notif.id);
     }
-    let real_path = match state.root.resolve_read(&virtual_path) {
+    let real_path = match state.view.resolve_read(&virtual_path) {
         Ok(path) => path,
         Err(error) => return respond_error(listener, notif.id, errno(&error)),
     };
@@ -207,10 +207,10 @@ fn handle_statx(listener: RawFd, state: &mut State, notif: &SeccompNotif) -> io:
             Ok(path) => path,
             Err(error) => return respond_error(listener, notif.id, errno(&error)),
         };
-    if !state.root.projects(&virtual_path) {
+    if !state.view.projects(&virtual_path) {
         return respond_continue(listener, notif.id);
     }
-    let real_path = match state.root.resolve_read(&virtual_path) {
+    let real_path = match state.view.resolve_read(&virtual_path) {
         Ok(path) => path,
         Err(error) => return respond_error(listener, notif.id, errno(&error)),
     };
@@ -259,10 +259,10 @@ fn handle_access(listener: RawFd, state: &mut State, notif: &SeccompNotif) -> io
         Ok(path) => path,
         Err(error) => return respond_error(listener, notif.id, errno(&error)),
     };
-    if !state.root.projects(&virtual_path) {
+    if !state.view.projects(&virtual_path) {
         return respond_continue(listener, notif.id);
     }
-    let real_path = match state.root.resolve_read(&virtual_path) {
+    let real_path = match state.view.resolve_read(&virtual_path) {
         Ok(path) => path,
         Err(error) => return respond_error(listener, notif.id, errno(&error)),
     };
@@ -294,10 +294,10 @@ fn handle_mkdir(listener: RawFd, state: &mut State, notif: &SeccompNotif) -> io:
         Ok(path) => path,
         Err(error) => return respond_error(listener, notif.id, errno(&error)),
     };
-    if !state.root.projects(&path) {
+    if !state.view.projects(&path) {
         return respond_continue(listener, notif.id);
     }
-    match state.root.mkdir(&path, mode) {
+    match state.view.mkdir(&path, mode) {
         Ok(()) => respond_value(listener, notif.id, 0),
         Err(error) => respond_error(listener, notif.id, errno(&error)),
     }
@@ -320,10 +320,10 @@ fn handle_unlink(listener: RawFd, state: &mut State, notif: &SeccompNotif) -> io
         Ok(path) => path,
         Err(error) => return respond_error(listener, notif.id, errno(&error)),
     };
-    if !state.root.projects(&path) {
+    if !state.view.projects(&path) {
         return respond_continue(listener, notif.id);
     }
-    match state.root.unlink(&path, flags & libc::AT_REMOVEDIR != 0) {
+    match state.view.unlink(&path, flags & libc::AT_REMOVEDIR != 0) {
         Ok(()) => respond_value(listener, notif.id, 0),
         Err(error) => respond_error(listener, notif.id, errno(&error)),
     }
@@ -363,15 +363,15 @@ fn handle_rename(listener: RawFd, state: &mut State, notif: &SeccompNotif) -> io
         Ok(path) => path,
         Err(error) => return respond_error(listener, notif.id, errno(&error)),
     };
-    let old_projected = state.root.projects(&old);
-    let new_projected = state.root.projects(&new);
+    let old_projected = state.view.projects(&old);
+    let new_projected = state.view.projects(&new);
     if !old_projected && !new_projected {
         return respond_continue(listener, notif.id);
     }
-    if !old_projected || !new_projected || !state.root.same_projection(&old, &new) {
+    if !old_projected || !new_projected || !state.view.same_projection(&old, &new) {
         return respond_error(listener, notif.id, libc::EXDEV);
     }
-    match state.root.rename(&old, &new) {
+    match state.view.rename(&old, &new) {
         Ok(()) => respond_value(listener, notif.id, 0),
         Err(error) => respond_error(listener, notif.id, errno(&error)),
     }
@@ -409,10 +409,10 @@ fn handle_readlink(listener: RawFd, state: &mut State, notif: &SeccompNotif) -> 
             Err(error) => respond_error(listener, notif.id, errno(&error)),
         };
     }
-    if !state.root.projects(&virtual_path) {
+    if !state.view.projects(&virtual_path) {
         return respond_continue(listener, notif.id);
     }
-    let real_path = match state.root.resolve_read(&virtual_path) {
+    let real_path = match state.view.resolve_read(&virtual_path) {
         Ok(path) => path,
         Err(error) => return respond_error(listener, notif.id, errno(&error)),
     };
@@ -443,10 +443,10 @@ fn handle_symlink(listener: RawFd, state: &mut State, notif: &SeccompNotif) -> i
         Ok(path) => path,
         Err(error) => return respond_error(listener, notif.id, errno(&error)),
     };
-    if !state.root.projects(&link) {
+    if !state.view.projects(&link) {
         return respond_continue(listener, notif.id);
     }
-    match state.root.symlink(&target, &link) {
+    match state.view.symlink(&target, &link) {
         Ok(()) => respond_value(listener, notif.id, 0),
         Err(error) => respond_error(listener, notif.id, errno(&error)),
     }
@@ -456,12 +456,18 @@ fn handle_getdents(listener: RawFd, state: &mut State, notif: &SeccompNotif) -> 
     let fd = notif.data.args[0] as i32;
     let buffer = notif.data.args[1];
     let capacity = notif.data.args[2] as usize;
-    let Some(directory) = state
-        .directories
-        .get_mut(&(remote::process_key(notif.pid), fd))
-    else {
+    let key = (remote::process_key(notif.pid), fd);
+    let Some(open_directory) = state.directories.get(&key) else {
         return respond_continue(listener, notif.id);
     };
+    if !remote::directory_fd_matches(state, notif.pid, fd, open_directory) {
+        state.directories.remove(&key);
+        return respond_continue(listener, notif.id);
+    }
+    let directory = state
+        .directories
+        .get_mut(&key)
+        .expect("directory was validated immediately above");
     let mut output = Vec::with_capacity(capacity.min(8192));
     while directory.cursor < directory.entries.len() {
         let entry = &directory.entries[directory.cursor];
@@ -490,20 +496,29 @@ fn handle_chdir(listener: RawFd, state: &mut State, notif: &SeccompNotif) -> io:
         }
     } else {
         let fd = notif.data.args[0] as i32;
-        if let Some(directory) = state.directories.get(&(remote::process_key(notif.pid), fd)) {
-            directory.path.clone()
-        } else {
+        let key = (remote::process_key(notif.pid), fd);
+        let Some(directory) = state.directories.get(&key) else {
+            return respond_continue(listener, notif.id);
+        };
+        if !remote::directory_fd_matches(state, notif.pid, fd, directory) {
+            state.directories.remove(&key);
             return respond_continue(listener, notif.id);
         }
+        state
+            .directories
+            .get(&key)
+            .expect("directory was validated immediately above")
+            .path
+            .clone()
     };
 
-    if !state.root.projects(&virtual_path) {
+    if !state.view.projects(&virtual_path) {
         state
             .virtual_cwds
             .insert(remote::process_key(notif.pid), virtual_path);
         return respond_continue(listener, notif.id);
     }
-    let real_path = match state.root.resolve_read(&virtual_path) {
+    let real_path = match state.view.resolve_read(&virtual_path) {
         Ok(path) => path,
         Err(error) => return respond_error(listener, notif.id, errno(&error)),
     };
@@ -520,7 +535,7 @@ fn handle_chdir(listener: RawFd, state: &mut State, notif: &SeccompNotif) -> io:
         .virtual_cwds
         .insert(remote::process_key(notif.pid), virtual_path.clone());
 
-    // Let the kernel maintain cwd when the visible path is the host path. Upper-only
+    // Let the kernel maintain cwd when the visible path is the host path. Projected
     // directories cannot be entered in the tracee's mount view, so emulate chdir and
     // use virtual_cwds for subsequent relative operations and getcwd.
     if real_path == virtual_path {
@@ -550,10 +565,10 @@ fn handle_truncate(listener: RawFd, state: &mut State, notif: &SeccompNotif) -> 
         Ok(path) => path,
         Err(error) => return respond_error(listener, notif.id, errno(&error)),
     };
-    if !state.root.projects(&virtual_path) {
+    if !state.view.projects(&virtual_path) {
         return respond_continue(listener, notif.id);
     }
-    let real_path = match state.root.prepare_mutation(&virtual_path) {
+    let real_path = match state.view.prepare_mutation(&virtual_path) {
         Ok(path) => path,
         Err(error) => return respond_error(listener, notif.id, errno(&error)),
     };
@@ -580,10 +595,10 @@ fn handle_chmod(listener: RawFd, state: &mut State, notif: &SeccompNotif) -> io:
         Ok(path) => path,
         Err(error) => return respond_error(listener, notif.id, errno(&error)),
     };
-    if !state.root.projects(&virtual_path) {
+    if !state.view.projects(&virtual_path) {
         return respond_continue(listener, notif.id);
     }
-    let real_path = match state.root.prepare_mutation(&virtual_path) {
+    let real_path = match state.view.prepare_mutation(&virtual_path) {
         Ok(path) => path,
         Err(error) => return respond_error(listener, notif.id, errno(&error)),
     };
@@ -622,10 +637,10 @@ fn handle_chown(listener: RawFd, state: &mut State, notif: &SeccompNotif) -> io:
         Ok(path) => path,
         Err(error) => return respond_error(listener, notif.id, errno(&error)),
     };
-    if !state.root.projects(&virtual_path) {
+    if !state.view.projects(&virtual_path) {
         return respond_continue(listener, notif.id);
     }
-    let real_path = match state.root.prepare_mutation(&virtual_path) {
+    let real_path = match state.view.prepare_mutation(&virtual_path) {
         Ok(path) => path,
         Err(error) => return respond_error(listener, notif.id, errno(&error)),
     };
@@ -651,10 +666,10 @@ fn handle_utimensat(listener: RawFd, state: &mut State, notif: &SeccompNotif) ->
             Ok(path) => path,
             Err(error) => return respond_error(listener, notif.id, errno(&error)),
         };
-    if !state.root.projects(&virtual_path) {
+    if !state.view.projects(&virtual_path) {
         return respond_continue(listener, notif.id);
     }
-    let real_path = match state.root.prepare_mutation(&virtual_path) {
+    let real_path = match state.view.prepare_mutation(&virtual_path) {
         Ok(path) => path,
         Err(error) => return respond_error(listener, notif.id, errno(&error)),
     };
@@ -684,7 +699,7 @@ fn handle_utimensat(listener: RawFd, state: &mut State, notif: &SeccompNotif) ->
     respond_result(listener, notif.id, result)
 }
 
-fn dirent_record(entry: &crate::root::DirEntry, next_offset: usize) -> Vec<u8> {
+fn dirent_record(entry: &crate::bind::DirEntry, next_offset: usize) -> Vec<u8> {
     let name = entry.name.as_bytes();
     // linux_dirent64 keeps d_type before the flexible d_name field.
     let raw_length = 8 + 8 + 2 + 1 + name.len() + 1;

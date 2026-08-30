@@ -62,13 +62,35 @@ pub(crate) fn resolve_path(
     }
     let base = if dirfd == libc::AT_FDCWD {
         virtual_cwd(state, pid).unwrap_or_else(|| process_cwd(pid, state))
-    } else if let Some(directory) = state.directories.get(&(process_key(pid), dirfd)) {
+    } else if let Some(directory) = state
+        .directories
+        .get(&(process_key(pid), dirfd))
+        .filter(|directory| directory_fd_matches(state, pid, dirfd, directory))
+    {
         directory.path.clone()
     } else {
         let host = std::fs::read_link(format!("/proc/{pid}/fd/{dirfd}"))?;
-        host_to_virtual(&host, state.root.upper())
+        state.view.virtual_for_host(&host)
     };
     Ok(normalize(&base.join(path)))
+}
+
+pub(crate) fn directory_fd_matches(
+    state: &State,
+    pid: u32,
+    fd: i32,
+    directory: &super::OpenDirectory,
+) -> bool {
+    let Ok(actual) = std::fs::read_link(format!("/proc/{pid}/fd/{fd}")) else {
+        return false;
+    };
+    let Ok(expected) = state.view.resolve_read(&directory.path) else {
+        return false;
+    };
+    // The tracee can close a projected directory and later reuse the same fd for
+    // an unrelated path. Seccomp notifications do not provide an after-close
+    // hook, so validate the live fd before trusting our fd-indexed virtual state.
+    std::fs::canonicalize(&expected).unwrap_or(expected) == actual
 }
 
 pub(crate) fn virtual_cwd(state: &State, pid: u32) -> Option<PathBuf> {
@@ -128,7 +150,7 @@ fn read_memory(pid: u32, address: u64, length: usize) -> io::Result<Vec<u8>> {
 fn process_cwd(pid: u32, state: &State) -> PathBuf {
     let host =
         std::fs::read_link(format!("/proc/{pid}/cwd")).unwrap_or_else(|_| PathBuf::from("/"));
-    host_to_virtual(&host, state.root.upper())
+    state.view.virtual_for_host(&host)
 }
 
 fn process_parent(pid: u32) -> Option<u32> {
@@ -143,12 +165,6 @@ fn process_status_field(pid: u32, name: &str) -> Option<u32> {
         .trim()
         .parse()
         .ok()
-}
-
-fn host_to_virtual(host: &Path, upper: &Path) -> PathBuf {
-    host.strip_prefix(upper)
-        .map(|relative| Path::new("/").join(relative))
-        .unwrap_or_else(|_| host.to_path_buf())
 }
 
 fn normalize(path: &Path) -> PathBuf {

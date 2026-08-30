@@ -13,7 +13,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::Arc;
 
-use crate::root::{DirEntry, RootView};
+use crate::bind::{BindView, DirEntry};
 
 static CHILD_PROCESS: AtomicI32 = AtomicI32::new(0);
 const FORWARDED_SIGNALS: [i32; 4] = [libc::SIGTERM, libc::SIGINT, libc::SIGHUP, libc::SIGQUIT];
@@ -22,16 +22,36 @@ const SETUP_READY: u8 = 1;
 const SETUP_UNAVAILABLE: u8 = 0;
 
 pub(crate) enum RunOutcome {
+    Exited(ChildStatus),
+    Unavailable { command: Command, reason: String },
+}
+
+pub(crate) enum ChildStatus {
     Exited(i32),
-    Unavailable {
-        root: RootView,
-        command: Command,
-        reason: String,
-    },
+    Signaled(i32),
+}
+
+pub(crate) fn exit_with_status(status: ChildStatus) -> ! {
+    match status {
+        ChildStatus::Exited(code) => std::process::exit(code),
+        ChildStatus::Signaled(signal) => unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = libc::SIG_DFL;
+            libc::sigemptyset(&mut action.sa_mask);
+            libc::sigaction(signal, &action, std::ptr::null_mut());
+
+            let mut unblocked: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&mut unblocked);
+            libc::sigaddset(&mut unblocked, signal);
+            libc::sigprocmask(libc::SIG_UNBLOCK, &unblocked, std::ptr::null_mut());
+            libc::kill(libc::getpid(), signal);
+            libc::_exit(128 + signal);
+        },
+    }
 }
 
 pub(crate) struct State {
-    root: RootView,
+    view: BindView,
     directories: HashMap<(u32, i32), OpenDirectory>,
     virtual_cwds: HashMap<u32, PathBuf>,
 }
@@ -43,43 +63,36 @@ pub(crate) struct OpenDirectory {
 }
 
 impl State {
-    fn new(root: RootView) -> Self {
+    fn new(view: BindView) -> Self {
         Self {
-            root,
+            view,
             directories: HashMap::new(),
             virtual_cwds: HashMap::new(),
         }
     }
 }
 
-pub(crate) fn run(root: RootView, mut command: Command) -> io::Result<RunOutcome> {
-    let supervisor_root = match root.reopen() {
-        Ok(root) => root,
+pub(crate) fn run(view: BindView, mut command: Command, quiet: bool) -> io::Result<RunOutcome> {
+    let supervisor_view = match view.reopen() {
+        Ok(view) => view,
         Err(error) => {
             return Ok(RunOutcome::Unavailable {
-                root,
                 command,
-                reason: format!("cow-root-setup-failed error={error}"),
+                reason: format!("bind-view-setup-failed error={error}"),
             });
         }
     };
     let (parent_socket, child_socket) = match socket_pair() {
         Ok(sockets) => sockets,
         Err(error) => {
-            return Ok(unavailable(
-                root,
-                command,
-                "cow-root-socket-unavailable",
-                error,
-            ));
+            return Ok(unavailable(command, "bind-view-socket-unavailable", error));
         }
     };
     let pid = unsafe { libc::fork() };
     if pid < 0 {
         return Ok(unavailable(
-            root,
             command,
-            "cow-root-fork-unavailable",
+            "bind-view-fork-unavailable",
             io::Error::last_os_error(),
         ));
     }
@@ -88,7 +101,7 @@ pub(crate) fn run(root: RootView, mut command: Command) -> io::Result<RunOutcome
         // The caller owns the execution process group. Fork and exec preserve
         // that PGID; creating a nested group here would let the command escape
         // a supervisor that kills pathshim's group as one execution.
-        child_main(child_socket, &mut command, root.probe_path());
+        child_main(child_socket, &mut command, view.probe_path());
     }
     drop(child_socket);
 
@@ -97,16 +110,15 @@ pub(crate) fn run(root: RootView, mut command: Command) -> io::Result<RunOutcome
             unsafe { libc::kill(pid, libc::SIGKILL) };
             let _ = wait_for_child(pid);
             return Ok(unavailable(
-                root,
                 command,
-                "cow-root-listener-handshake-failed",
+                "bind-view-listener-handshake-failed",
                 error,
             ));
         }
         Ok(Setup::Ready(listener)) => listener,
         Ok(Setup::Unavailable(error)) => {
             let _ = wait_for_child(pid);
-            return Ok(unavailable(root, command, "cow-root-unavailable", error));
+            return Ok(unavailable(command, "bind-view-unavailable", error));
         }
     };
     let stop = Arc::new(AtomicBool::new(false));
@@ -114,8 +126,10 @@ pub(crate) fn run(root: RootView, mut command: Command) -> io::Result<RunOutcome
     let supervisor = match std::thread::Builder::new()
         .name("pathshim-fs".to_owned())
         .spawn(move || {
-            if let Err(error) = supervise(listener, supervisor_root, supervisor_stop) {
-                eprintln!("pathshim: filesystem supervisor stopped: {error}");
+            if let Err(error) = supervise(listener, supervisor_view, supervisor_stop) {
+                if !quiet {
+                    eprintln!("pathshim: filesystem supervisor stopped: {error}");
+                }
             }
         }) {
         Ok(supervisor) => supervisor,
@@ -123,9 +137,8 @@ pub(crate) fn run(root: RootView, mut command: Command) -> io::Result<RunOutcome
             unsafe { libc::kill(pid, libc::SIGKILL) };
             let _ = wait_for_child(pid);
             return Ok(unavailable(
-                root,
                 command,
-                "cow-root-supervisor-unavailable",
+                "bind-view-supervisor-unavailable",
                 error,
             ));
         }
@@ -135,7 +148,6 @@ pub(crate) fn run(root: RootView, mut command: Command) -> io::Result<RunOutcome
         Err(error) => {
             stop_attempt(pid, &stop, supervisor);
             return Ok(RunOutcome::Unavailable {
-                root,
                 command,
                 reason: format!("signal-forwarding-unavailable error={error}"),
             });
@@ -145,9 +157,8 @@ pub(crate) fn run(root: RootView, mut command: Command) -> io::Result<RunOutcome
         drop(signal_forwarding);
         stop_attempt(pid, &stop, supervisor);
         return Ok(RunOutcome::Unavailable {
-            root,
             command,
-            reason: format!("cow-root-probe-start-failed error={error}"),
+            reason: format!("bind-view-probe-start-failed error={error}"),
         });
     }
 
@@ -157,9 +168,8 @@ pub(crate) fn run(root: RootView, mut command: Command) -> io::Result<RunOutcome
             drop(signal_forwarding);
             stop_attempt(pid, &stop, supervisor);
             return Ok(RunOutcome::Unavailable {
-                root,
                 command,
-                reason: format!("cow-root-probe-unavailable error={error}"),
+                reason: format!("bind-view-probe-unavailable error={error}"),
             });
         }
     };
@@ -167,28 +177,24 @@ pub(crate) fn run(root: RootView, mut command: Command) -> io::Result<RunOutcome
         drop(signal_forwarding);
         stop_attempt(pid, &stop, supervisor);
         return Ok(RunOutcome::Unavailable {
-            root,
             command,
             reason: format!(
-                "cow-root-probe-failed error={}",
+                "bind-view-probe-failed error={}",
                 io::Error::from_raw_os_error(probe_error)
             ),
         });
     }
 
-    eprintln!(
-        "pathshim: collect mode=cow-view projections={} features=host-read-fallback,copy-up,whiteout",
-        root.projection_count()
-    );
+    if !quiet {
+        eprintln!(
+            "pathshim: collect mode=bind-view projections={} features=replace,shared-source",
+            view.projection_count()
+        );
+    }
     if let Err(error) = write_byte(parent_socket.as_raw_fd(), 1) {
         drop(signal_forwarding);
         stop_attempt(pid, &stop, supervisor);
-        return Ok(unavailable(
-            root,
-            command,
-            "cow-root-probe-finish-failed",
-            error,
-        ));
+        return Ok(unavailable(command, "bind-view-probe-finish-failed", error));
     }
 
     let status = wait_for_child(pid)?;
@@ -198,9 +204,8 @@ pub(crate) fn run(root: RootView, mut command: Command) -> io::Result<RunOutcome
     Ok(RunOutcome::Exited(status))
 }
 
-fn unavailable(root: RootView, command: Command, reason: &str, error: io::Error) -> RunOutcome {
+fn unavailable(command: Command, reason: &str, error: io::Error) -> RunOutcome {
     RunOutcome::Unavailable {
-        root,
         command,
         reason: format!("{reason} error={error}"),
     }
@@ -315,8 +320,8 @@ fn child_error(message: String) -> ! {
     unsafe { libc::_exit(1) }
 }
 
-fn supervise(listener: OwnedFd, root: RootView, stop: Arc<AtomicBool>) -> io::Result<()> {
-    let mut state = State::new(root);
+fn supervise(listener: OwnedFd, view: BindView, stop: Arc<AtomicBool>) -> io::Result<()> {
+    let mut state = State::new(view);
     while !stop.load(Ordering::Acquire) {
         let mut poll_fd = libc::pollfd {
             fd: listener.as_raw_fd(),
@@ -357,7 +362,7 @@ fn supervise(listener: OwnedFd, root: RootView, stop: Arc<AtomicBool>) -> io::Re
     Ok(())
 }
 
-fn wait_for_child(pid: i32) -> io::Result<i32> {
+fn wait_for_child(pid: i32) -> io::Result<ChildStatus> {
     let mut status = 0;
     loop {
         let result = unsafe { libc::waitpid(pid, &mut status, 0) };
@@ -369,10 +374,10 @@ fn wait_for_child(pid: i32) -> io::Result<i32> {
             return Err(error);
         }
         if libc::WIFEXITED(status) {
-            return Ok(libc::WEXITSTATUS(status));
+            return Ok(ChildStatus::Exited(libc::WEXITSTATUS(status)));
         }
         if libc::WIFSIGNALED(status) {
-            return Ok(128 + libc::WTERMSIG(status));
+            return Ok(ChildStatus::Signaled(libc::WTERMSIG(status)));
         }
     }
 }

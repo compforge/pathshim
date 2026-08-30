@@ -22,7 +22,7 @@ done
 docker info >/dev/null
 docker image inspect "$ffmpeg_image" >/dev/null
 
-mkdir -p "$run_dir/input" "$run_dir/upper/output"
+mkdir -p "$run_dir/input" "$run_dir/output"
 
 RUSTFLAGS="-C target-feature=+crt-static" \
   cargo build --manifest-path "$repo_dir/Cargo.toml" --locked --release \
@@ -47,36 +47,36 @@ docker run --rm \
   --user "$caller" \
   --volume "$pathshim:/pathshim:ro" \
   --volume "$run_dir/input:/fixture:ro" \
-  --volume "$run_dir/upper:/upper" \
+  --volume "$run_dir/output:/physical-output" \
   --entrypoint /pathshim \
   "$ffmpeg_image" \
-  --rootfs /upper -- "$ffmpeg_bin" \
+  --bind /physical-output:/output -- "$ffmpeg_bin" \
   -hide_banner -loglevel error -y \
   -i /fixture/input.wav -c:a pcm_s16le /output/transcoded.wav \
   2>"$run_dir/pathshim.stderr"
 
 case "$(<"$run_dir/pathshim.stderr")" in
-  *"collect mode=cow-view"*) ;;
+  *"collect mode=bind-view"*) ;;
   *)
     cat "$run_dir/pathshim.stderr" >&2
     exit 1
     ;;
 esac
-test -s "$run_dir/upper/output/transcoded.wav"
+test -s "$run_dir/output/transcoded.wav"
 
 duration=$(docker run --rm \
   --cap-drop=ALL \
   --security-opt no-new-privileges=true \
   --user "$caller" \
-  --volume "$run_dir/upper:/upper:ro" \
+  --volume "$run_dir/output:/output:ro" \
   --entrypoint "$ffprobe_bin" \
   "$ffmpeg_image" \
   -v error -show_entries format=duration \
   -of default=noprint_wrappers=1:nokey=1 \
-  /upper/output/transcoded.wav)
+  /output/transcoded.wav)
 
 test "$duration" = "0.200000"
 printf 'pathshim ffmpeg smoke passed: arch=%s bytes=%s duration=%s\n' \
   "$(uname -m)" \
-  "$(wc -c < "$run_dir/upper/output/transcoded.wav" | tr -d ' ')" \
+  "$(wc -c < "$run_dir/output/transcoded.wav" | tr -d ' ')" \
   "$duration"

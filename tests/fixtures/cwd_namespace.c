@@ -49,19 +49,19 @@ static void require_cwd(const char *expected) {
 
 static void *change_thread_cwd(void *unused) {
     (void)unused;
-    require_directory("/thread");
-    if (chdir("/thread") < 0) {
+    require_directory("/workspace/thread");
+    if (chdir("/workspace/thread") < 0) {
         fail("thread chdir");
     }
-    require_cwd("/thread");
+    require_cwd("/workspace/thread");
     return NULL;
 }
 
 int main(void) {
-    require_cwd("/start");
+    require_cwd("/workspace/start");
 
-    require_directory("/fd-target");
-    int fd = open("/fd-target", O_RDONLY | O_DIRECTORY);
+    require_directory("/workspace/fd-target");
+    int fd = open("/workspace/fd-target", O_RDONLY | O_DIRECTORY);
     if (fd < 0) {
         fail("open directory");
     }
@@ -69,7 +69,7 @@ int main(void) {
         fail("fchdir");
     }
     close(fd);
-    require_cwd("/fd-target");
+    require_cwd("/workspace/fd-target");
 
     pthread_t thread;
     if (pthread_create(&thread, NULL, change_thread_cwd, NULL) != 0) {
@@ -78,18 +78,18 @@ int main(void) {
     if (pthread_join(thread, NULL) != 0) {
         fail("pthread_join");
     }
-    require_cwd("/thread");
+    require_cwd("/workspace/thread");
 
     pid_t child = fork();
     if (child < 0) {
         fail("fork");
     }
     if (child == 0) {
-        require_directory("/child");
-        if (chdir("/child") < 0) {
+        require_directory("/workspace/child");
+        if (chdir("/workspace/child") < 0) {
             fail("child chdir");
         }
-        require_cwd("/child");
+        require_cwd("/workspace/child");
         _exit(0);
     }
 
@@ -101,7 +101,7 @@ int main(void) {
         fprintf(stderr, "child failed: status=%d\n", status);
         return 1;
     }
-    require_cwd("/thread");
+    require_cwd("/workspace/thread");
 
     int output = open("relative-output", O_WRONLY | O_CREAT | O_TRUNC, 0600);
     if (output < 0) {
