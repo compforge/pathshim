@@ -34,6 +34,7 @@ RUSTFLAGS="-C target-feature=+crt-static" \
 CGO_ENABLED=0 go build -o "$run_dir/image/fixture" \
   "$repo_dir/tests/fixtures/static_go.go"
 cp "$run_dir/target/release/pathshim" "$run_dir/image/pathshim"
+cp "$run_dir/image/fixture" "$run_dir/bind-source/app"
 
 tar -C "$run_dir/image" -cf "$run_dir/image.tar" .
 docker import "$run_dir/image.tar" "$image" >/dev/null
@@ -60,7 +61,7 @@ bind_output=$("${docker_run[@]}" \
   --volume "$run_dir/bind-source:/source" \
   --volume "$run_dir/bind-destination:/guest" \
   "$image" \
-  /pathshim --bind /source:/guest -- /fixture /guest/go-output \
+  /pathshim --bind /source:/guest -- /guest/app /guest/go-output \
   2>"$run_dir/bind.stderr")
 
 test -s "$run_dir/bind-source/go-output"
