@@ -23,10 +23,10 @@ docker info >/dev/null
 
 mkdir -p \
   "$run_dir/image" \
-  "$run_dir/rootfs" \
-  "$run_dir/cwd-rootfs" \
-  "$run_dir/bind-upper" \
-  "$run_dir/bind-lower"
+  "$run_dir/bind-source" \
+  "$run_dir/bind-destination" \
+  "$run_dir/passthrough-source" \
+  "$run_dir/passthrough-destination"
 
 RUSTFLAGS="-C target-feature=+crt-static" \
   cargo build --manifest-path "$repo_dir/Cargo.toml" --locked --release \
@@ -56,38 +56,29 @@ assert_mode() {
   esac
 }
 
-cow_output=$("${docker_run[@]}" \
-  --volume "$run_dir/rootfs:/rootfs" \
+bind_output=$("${docker_run[@]}" \
+  --volume "$run_dir/bind-source:/source" \
+  --volume "$run_dir/bind-destination:/guest" \
   "$image" \
-  /pathshim --rootfs /rootfs -- /fixture \
-  2>"$run_dir/cow.stderr")
+  /pathshim --bind /source:/guest -- /fixture /guest/go-output \
+  2>"$run_dir/bind.stderr")
 
-test -s "$run_dir/rootfs/project/go-output"
-test "$cow_output" = "$(cat "$run_dir/rootfs/project/go-output")"
-assert_mode "$run_dir/cow.stderr" cow-view
-
-cwd_output=$("${docker_run[@]}" \
-  --security-opt "seccomp=$deny_profile" \
-  --volume "$run_dir/cwd-rootfs:/rootfs" \
-  "$image" \
-  /pathshim --rootfs /rootfs -- /fixture relative-output \
-  2>"$run_dir/cwd.stderr")
-
-test -s "$run_dir/cwd-rootfs/relative-output"
-test "$cwd_output" = "$(cat "$run_dir/cwd-rootfs/relative-output")"
-assert_mode "$run_dir/cwd.stderr" cwd
+test -s "$run_dir/bind-source/go-output"
+test ! -e "$run_dir/bind-destination/go-output"
+test "$bind_output" = "$(cat "$run_dir/bind-source/go-output")"
+assert_mode "$run_dir/bind.stderr" bind-view
 
 passthrough_output=$("${docker_run[@]}" \
   --security-opt "seccomp=$deny_profile" \
-  --volume "$run_dir/bind-upper:/upper" \
-  --volume "$run_dir/bind-lower:/guest" \
+  --volume "$run_dir/passthrough-source:/source" \
+  --volume "$run_dir/passthrough-destination:/guest" \
   "$image" \
-  /pathshim --bind /upper:/guest -- /fixture /guest/passthrough-output \
+  /pathshim --bind /source:/guest -- /fixture /guest/passthrough-output \
   2>"$run_dir/passthrough.stderr")
 
-test -s "$run_dir/bind-lower/passthrough-output"
-test ! -e "$run_dir/bind-upper/passthrough-output"
-test "$passthrough_output" = "$(cat "$run_dir/bind-lower/passthrough-output")"
+test -s "$run_dir/passthrough-destination/passthrough-output"
+test ! -e "$run_dir/passthrough-source/passthrough-output"
+test "$passthrough_output" = "$(cat "$run_dir/passthrough-destination/passthrough-output")"
 assert_mode "$run_dir/passthrough.stderr" passthrough
 
-printf 'pathshim Docker smoke passed: arch=%s modes=cow-view,cwd,passthrough\n' "$(uname -m)"
+printf 'pathshim Docker smoke passed: arch=%s modes=bind-view,passthrough\n' "$(uname -m)"

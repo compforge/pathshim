@@ -2,27 +2,27 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 
 pub(crate) const HELP: &str = "\
-Run a command with a best-effort root filesystem view.
+Run a command with best-effort bind path mappings.
 
 Usage:
-  pathshim -r <PATH> [-b <SOURCE:DEST>] [-w <PATH>] [--] <COMMAND> [ARGS...]
-  pathshim --bind=<SOURCE:DEST> [--cwd=<PATH>] [--] <COMMAND> [ARGS...]
+  pathshim -b <SOURCE:DEST> [-b <SOURCE:DEST> ...] [-w <PATH>] [--] <COMMAND> [ARGS...]
+  pathshim --bind=<SOURCE:DEST> [--cwd=<PATH>] [--quiet] [--] <COMMAND> [ARGS...]
 
 Options:
-  -r, --rootfs <PATH>  Directory presented as the command's best-effort root filesystem
   -b, --bind <SOURCE:DEST>
-                       Collect writes below guest DEST into SOURCE; may be repeated
+                       Present SOURCE at guest DEST; may be repeated
   -w, --cwd, --pwd <PATH>
                        Initial working directory in the guest filesystem [default: /]
+      --quiet          Suppress pathshim capability diagnostics
   -h, --help           Print help
   -V, --version        Print version
 ";
 
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct RunArgs {
-    pub(crate) rootfs: Option<PathBuf>,
     pub(crate) binds: Vec<BindArg>,
     pub(crate) cwd: PathBuf,
+    pub(crate) quiet: bool,
     pub(crate) command: OsString,
     pub(crate) args: Vec<OsString>,
 }
@@ -45,9 +45,9 @@ where
     I: IntoIterator<Item = OsString>,
 {
     let mut args = args.into_iter();
-    let mut rootfs = None;
     let mut binds = Vec::new();
     let mut cwd = None;
+    let mut quiet = false;
     let mut command = Vec::new();
     let mut parsing_options = true;
 
@@ -62,11 +62,8 @@ where
         if parsing_options && (arg == "-V" || arg == "--version") {
             return Ok(ParseResult::Version);
         }
-        if parsing_options && (arg == "-r" || arg == "--rootfs") {
-            let Some(value) = args.next() else {
-                return Err(format!("`{}` requires a path", arg.to_string_lossy()));
-            };
-            rootfs = Some(PathBuf::from(value));
+        if parsing_options && arg == "--quiet" {
+            quiet = true;
             continue;
         }
         if parsing_options && (arg == "-b" || arg == "--bind") {
@@ -84,16 +81,6 @@ where
             continue;
         }
         if parsing_options {
-            if let Some(value) = arg
-                .to_str()
-                .and_then(|value| value.strip_prefix("--rootfs="))
-            {
-                if value.is_empty() {
-                    return Err("`--rootfs` requires a path".to_owned());
-                }
-                rootfs = Some(PathBuf::from(value));
-                continue;
-            }
             if let Some(value) = arg.to_str().and_then(|value| value.strip_prefix("--bind=")) {
                 binds.push(parse_bind(OsString::from(value))?);
                 continue;
@@ -119,18 +106,16 @@ where
         break;
     }
 
-    if rootfs.is_none() && binds.is_empty() {
-        return Err(
-            "missing filesystem view: provide `--rootfs <PATH>` or `--bind SOURCE:DEST`".to_owned(),
-        );
+    if binds.is_empty() {
+        return Err("missing filesystem view: provide `--bind SOURCE:DEST`".to_owned());
     }
     let mut command = command.into_iter();
     let executable = command.next().ok_or_else(|| "missing command".to_owned())?;
 
     Ok(ParseResult::Run(RunArgs {
-        rootfs,
         binds,
         cwd: cwd.unwrap_or_else(|| PathBuf::from("/")),
+        quiet,
         command: executable,
         args: command.collect(),
     }))
@@ -169,31 +154,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_short_rootfs_option() {
-        let result = parse(os_args(&[
-            "-r",
-            "/rootfs/one",
-            "--",
-            "/bin/sh",
-            "-c",
-            "pwd",
-        ]))
-        .unwrap();
-
-        assert_eq!(
-            result,
-            ParseResult::Run(RunArgs {
-                rootfs: Some(PathBuf::from("/rootfs/one")),
-                binds: Vec::new(),
-                cwd: PathBuf::from("/"),
-                command: OsString::from("/bin/sh"),
-                args: os_args(&["-c", "pwd"]),
-            })
-        );
-    }
-
-    #[test]
-    fn parses_repeatable_binds_without_rootfs() {
+    fn parses_repeatable_binds() {
         let result = parse(os_args(&[
             "--bind",
             "/upper/one:/guest/one",
@@ -205,7 +166,6 @@ mod tests {
         assert_eq!(
             result,
             ParseResult::Run(RunArgs {
-                rootfs: None,
                 binds: vec![
                     BindArg {
                         source: PathBuf::from("/upper/one"),
@@ -217,6 +177,7 @@ mod tests {
                     },
                 ],
                 cwd: PathBuf::from("/"),
+                quiet: false,
                 command: OsString::from("true"),
                 args: Vec::new(),
             })
@@ -226,7 +187,7 @@ mod tests {
     #[test]
     fn accepts_command_without_separator() {
         let result =
-            parse(os_args(&["--rootfs=/rootfs/one", "/bin/sh"])).expect("command should parse");
+            parse(os_args(&["--bind=/upper:/guest", "/bin/sh"])).expect("command should parse");
 
         assert!(matches!(result, ParseResult::Run(_)));
     }
@@ -235,8 +196,8 @@ mod tests {
     fn parses_guest_cwd_aliases() {
         for option in ["-w", "--cwd", "--pwd"] {
             let ParseResult::Run(args) = parse(os_args(&[
-                "-r",
-                "/rootfs/one",
+                "--bind",
+                "/upper:/workspace",
                 option,
                 "/workspace",
                 "true",
@@ -247,9 +208,12 @@ mod tests {
             assert_eq!(args.cwd, PathBuf::from("/workspace"));
         }
 
-        let ParseResult::Run(args) =
-            parse(os_args(&["-r", "/rootfs/one", "--cwd=/workspace", "true"])).unwrap()
-        else {
+        let ParseResult::Run(args) = parse(os_args(&[
+            "--bind=/upper:/workspace",
+            "--cwd=/workspace",
+            "true",
+        ]))
+        .unwrap() else {
             panic!("expected run arguments");
         };
         assert_eq!(args.cwd, PathBuf::from("/workspace"));
@@ -266,7 +230,6 @@ mod tests {
     fn rejects_missing_filesystem_view() {
         let error = parse(os_args(&["--", "/bin/sh"])).unwrap_err();
 
-        assert!(error.contains("--rootfs"));
         assert!(error.contains("--bind"));
     }
 
@@ -279,8 +242,18 @@ mod tests {
 
     #[test]
     fn rejects_missing_command() {
-        let error = parse(os_args(&["-r", "/rootfs/one"])).unwrap_err();
+        let error = parse(os_args(&["--bind", "/upper:/workspace"])).unwrap_err();
 
         assert!(error.contains("command"));
+    }
+
+    #[test]
+    fn parses_quiet_mode() {
+        let ParseResult::Run(args) =
+            parse(os_args(&["--quiet", "--bind", "/upper:/workspace", "true"])).unwrap()
+        else {
+            panic!("expected run arguments");
+        };
+        assert!(args.quiet);
     }
 }

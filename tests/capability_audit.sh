@@ -25,22 +25,22 @@ done
 cargo build --manifest-path "$repo_dir/Cargo.toml" --locked \
   --target-dir "$run_dir/target" >/dev/null
 pathshim="$run_dir/target/debug/pathshim"
-lower="$run_dir/lower"
-upper="$run_dir/upper"
-mkdir -p "$lower" "$upper"
-printf 'hard-link-source\n' > "$lower/source.txt"
+destination="$run_dir/destination"
+source="$run_dir/source"
+mkdir -p "$destination" "$source"
+printf 'hard-link-source\n' > "$destination/source.txt"
 
-"$pathshim" --rootfs "$upper" -- "$(command -v ln)" \
-  "$lower/source.txt" "$lower/result.txt" \
+"$pathshim" --bind "$source:$destination" -- "$(command -v ln)" \
+  "$destination/source.txt" "$destination/result.txt" \
   2>"$run_dir/pathshim.stderr"
 
-mapped_result="$upper/${lower#/}/result.txt"
-if [[ -f $mapped_result && ! -e $lower/result.txt ]]; then
+mapped_result="$source/result.txt"
+if [[ -f $mapped_result && ! -e $destination/result.txt ]]; then
   coverage=projected
   result=$mapped_result
-elif [[ -f $lower/result.txt && ! -e $mapped_result ]]; then
-  coverage=lower-bypass
-  result=$lower/result.txt
+elif [[ -f $destination/result.txt && ! -e $mapped_result ]]; then
+  coverage=destination-bypass
+  result=$destination/result.txt
 else
   echo "hard-link result is missing or exists in multiple views" >&2
   exit 1

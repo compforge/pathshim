@@ -9,7 +9,7 @@ static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 
 struct TestPaths {
     base: PathBuf,
-    rootfs: PathBuf,
+    source: PathBuf,
 }
 
 impl TestPaths {
@@ -17,9 +17,9 @@ impl TestPaths {
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
         let base =
             std::env::temp_dir().join(format!("pathshim-cwd-e2e-{}-{id}", std::process::id()));
-        let rootfs = base.join("rootfs");
-        fs::create_dir_all(&rootfs).expect("create rootfs fixture");
-        Self { base, rootfs }
+        let source = base.join("workspace");
+        fs::create_dir_all(&source).expect("create bind source fixture");
+        Self { base, source }
     }
 }
 
@@ -32,10 +32,8 @@ impl Drop for TestPaths {
 #[test]
 fn initial_guest_cwd_sets_pwd_and_resolves_relative_writes() {
     let paths = TestPaths::new();
-    fs::create_dir_all(paths.rootfs.join("workspace")).unwrap();
-
     let output = run_pathshim(
-        &paths.rootfs,
+        &paths,
         "/workspace",
         "/bin/sh",
         &["-c", "printf '%s\\n' \"$PWD\"; pwd; echo cwd > result.txt"],
@@ -48,18 +46,18 @@ fn initial_guest_cwd_sets_pwd_and_resolves_relative_writes() {
     );
     assert_eq!(output.stdout, b"/workspace\n/workspace\n");
     assert_eq!(
-        fs::read_to_string(paths.rootfs.join("workspace/result.txt")).unwrap(),
+        fs::read_to_string(paths.source.join("result.txt")).unwrap(),
         "cwd\n"
     );
 }
 
 #[test]
-fn missing_initial_guest_cwd_is_created_in_upper() {
+fn missing_initial_guest_cwd_is_created_in_bind_source() {
     let paths = TestPaths::new();
 
     let output = run_pathshim(
-        &paths.rootfs,
-        "/does-not-exist",
+        &paths,
+        "/workspace/does-not-exist",
         "/bin/sh",
         &[
             "-c",
@@ -72,12 +70,14 @@ fn missing_initial_guest_cwd_is_created_in_upper() {
         "pathshim: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(output.stdout, b"/does-not-exist\n/does-not-exist\n");
-    assert!(
-        String::from_utf8_lossy(&output.stderr).contains("created guest cwd path=/does-not-exist")
-    );
     assert_eq!(
-        fs::read_to_string(paths.rootfs.join("does-not-exist/relative.txt")).unwrap(),
+        output.stdout,
+        b"/workspace/does-not-exist\n/workspace/does-not-exist\n"
+    );
+    assert!(String::from_utf8_lossy(&output.stderr)
+        .contains("created guest cwd path=/workspace/does-not-exist"));
+    assert_eq!(
+        fs::read_to_string(paths.source.join("does-not-exist/relative.txt")).unwrap(),
         "created\n"
     );
 }
@@ -85,11 +85,11 @@ fn missing_initial_guest_cwd_is_created_in_upper() {
 #[test]
 fn non_directory_initial_guest_cwd_falls_back_to_root() {
     let paths = TestPaths::new();
-    fs::write(paths.rootfs.join("not-a-directory"), "file").unwrap();
+    fs::write(paths.source.join("not-a-directory"), "file").unwrap();
 
     let output = run_pathshim(
-        &paths.rootfs,
-        "/not-a-directory",
+        &paths,
+        "/workspace/not-a-directory",
         "/bin/sh",
         &["-c", "printf '%s\\n' \"$PWD\"; pwd"],
     );
@@ -101,13 +101,13 @@ fn non_directory_initial_guest_cwd_falls_back_to_root() {
     );
     assert_eq!(output.stdout, b"/\n/\n");
     assert!(String::from_utf8_lossy(&output.stderr)
-        .contains("guest cwd unavailable requested=/not-a-directory fallback=/"));
+        .contains("guest cwd unavailable requested=/workspace/not-a-directory fallback=/"));
 }
 
 #[test]
 fn cwd_namespace_matches_common_proot_process_semantics() {
     let paths = TestPaths::new();
-    fs::create_dir_all(paths.rootfs.join("start")).unwrap();
+    fs::create_dir_all(paths.source.join("start")).unwrap();
     let binary = paths.base.join("cwd-namespace");
     let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cwd_namespace.c");
     let build = Command::new("cc")
@@ -123,7 +123,7 @@ fn cwd_namespace_matches_common_proot_process_semantics() {
         String::from_utf8_lossy(&build.stderr)
     );
 
-    let output = run_pathshim(&paths.rootfs, "/start", binary.to_str().unwrap(), &[]);
+    let output = run_pathshim(&paths, "/workspace/start", binary.to_str().unwrap(), &[]);
 
     assert!(
         output.status.success(),
@@ -131,15 +131,20 @@ fn cwd_namespace_matches_common_proot_process_semantics() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(
-        fs::read_to_string(paths.rootfs.join("thread/relative-output")).unwrap(),
+        fs::read_to_string(paths.source.join("thread/relative-output")).unwrap(),
         "thread cwd\n"
     );
 }
 
-fn run_pathshim(rootfs: &Path, cwd: &str, command: &str, args: &[&str]) -> std::process::Output {
+fn run_pathshim(
+    paths: &TestPaths,
+    cwd: &str,
+    command: &str,
+    args: &[&str],
+) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_pathshim"))
-        .arg("--rootfs")
-        .arg(rootfs)
+        .arg("--bind")
+        .arg(format!("{}:/workspace", paths.source.display()))
         .arg("--cwd")
         .arg(cwd)
         .arg("--")

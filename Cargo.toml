@@ -1,10 +1,10 @@
 [package]
 name = "pathshim"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2021"
 rust-version = "1.82"
 license = "Apache-2.0"
-description = "Run a command with a best-effort root filesystem view"
+description = "Run a command with best-effort userspace bind-path mapping"
 repository = "https://github.com/compforge/pathshim"
 
 [dependencies]
