@@ -414,6 +414,21 @@ fn quiet_mode_keeps_pathshim_diagnostics_out_of_stderr() {
     assert!(output.stderr.is_empty());
 }
 
+#[test]
+fn empty_path_preserves_kernel_enoent_semantics() {
+    let paths = TestPaths::new();
+    let destination = paths.destination.display();
+    let script = format!("cd {destination} && rm -f '' && test -d .");
+    let output = run_pathshim(&paths, "/bin/sh", &["-c", &script]);
+
+    assert!(
+        output.status.success(),
+        "empty pathname cleanup: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(paths.source.is_dir());
+}
+
 fn command(paths: &TestPaths) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_pathshim"));
     command.arg("--bind").arg(format!(
