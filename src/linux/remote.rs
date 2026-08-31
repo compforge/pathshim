@@ -94,6 +94,12 @@ pub(crate) fn resolve_path(
     dirfd: i32,
     path: &Path,
 ) -> io::Result<PathBuf> {
+    // An empty pathname is not a relative spelling of the working directory.
+    // Syscalls that support AT_EMPTY_PATH handle it before reaching this helper;
+    // ordinary pathname operations must preserve the kernel's ENOENT semantics.
+    if path.as_os_str().is_empty() {
+        return Err(io::Error::from_raw_os_error(libc::ENOENT));
+    }
     if path.is_absolute() {
         return Ok(normalize(path));
     }
