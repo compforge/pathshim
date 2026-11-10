@@ -117,12 +117,14 @@ The mapping works below language runtimes, so supported operations cover dynamic
 Run platform-independent validation locally:
 
 ```console
-cargo fmt --all -- --check
-cargo test
-cargo clippy --all-targets -- -D warnings
+make format
+make lint
+make test
 ```
 
-On Linux, `cargo test` also runs E2E coverage for replace semantics, mapping-external passthrough, multiple independent invocations sharing one source, external writers, guest cwd, pthread/fork cwd behavior, static Go build plus mapped `execve`/`execveat`, an installed Python runtime and child process, quiet diagnostics, and signal behavior. A skipped optional runtime is not verified coverage.
+`make format` applies Rust formatting; `make lint` checks formatting and runs Clippy with warnings denied. `make test` runs Cargo tests with the checked-in lockfile. These targets are also the entrypoints for `repocli validate`.
+
+On Linux, `make test` also runs E2E coverage for replace semantics, mapping-external passthrough, multiple independent invocations sharing one source, external writers, guest cwd, pthread/fork cwd behavior, static Go build plus mapped `execve`/`execveat`, an installed Python runtime and child process, quiet diagnostics, and signal behavior. A skipped optional runtime is not verified coverage.
 
 Run the Docker smoke test on each target architecture to verify `bind-view` and `passthrough` inside an unprivileged container:
 

@@ -41,6 +41,8 @@ tests/
 
 ## 开发约定
 
+- 检查统一走 Makefile：`make format` 格式化，`make lint` 检查格式及 Clippy，`make test` 执行 Cargo 测试；自动化使用 `repocli validate`。Linux E2E 属于 `make test`，Docker/ffmpeg smoke 仍使用独立脚本。
+
 - 每个可发布改动都必须递增根目录 `VERSION`，默认提升 patch 版本，并同步 `Cargo.toml` 与 `Cargo.lock`；CLI 测试负责校验版本源一致。
 - 不把网络、权限限制和进程治理带入 pathshim；bind path mapping 是唯一职责。
 - CLI 只表达 source、guest destination、cwd 和 command，不把 seccomp 等底层机制暴露成调用方概念。
