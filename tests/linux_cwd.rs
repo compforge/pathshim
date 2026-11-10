@@ -52,59 +52,6 @@ fn initial_guest_cwd_sets_pwd_and_resolves_relative_writes() {
 }
 
 #[test]
-fn missing_initial_guest_cwd_is_created_in_bind_source() {
-    let paths = TestPaths::new();
-
-    let output = run_pathshim(
-        &paths,
-        "/workspace/does-not-exist",
-        "/bin/sh",
-        &[
-            "-c",
-            "printf '%s\\n' \"$PWD\"; pwd; echo created > relative.txt",
-        ],
-    );
-
-    assert!(
-        output.status.success(),
-        "pathshim: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert_eq!(
-        output.stdout,
-        b"/workspace/does-not-exist\n/workspace/does-not-exist\n"
-    );
-    assert!(String::from_utf8_lossy(&output.stderr)
-        .contains("created guest cwd path=/workspace/does-not-exist"));
-    assert_eq!(
-        fs::read_to_string(paths.source.join("does-not-exist/relative.txt")).unwrap(),
-        "created\n"
-    );
-}
-
-#[test]
-fn non_directory_initial_guest_cwd_falls_back_to_root() {
-    let paths = TestPaths::new();
-    fs::write(paths.source.join("not-a-directory"), "file").unwrap();
-
-    let output = run_pathshim(
-        &paths,
-        "/workspace/not-a-directory",
-        "/bin/sh",
-        &["-c", "printf '%s\\n' \"$PWD\"; pwd"],
-    );
-
-    assert!(
-        output.status.success(),
-        "pathshim: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert_eq!(output.stdout, b"/\n/\n");
-    assert!(String::from_utf8_lossy(&output.stderr)
-        .contains("guest cwd unavailable requested=/workspace/not-a-directory fallback=/"));
-}
-
-#[test]
 fn cwd_namespace_matches_common_proot_process_semantics() {
     let paths = TestPaths::new();
     fs::create_dir_all(paths.source.join("start")).unwrap();

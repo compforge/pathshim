@@ -10,7 +10,7 @@ pathshim 是独立通用项目，不认识 bed、sandbox 等上层业务概念�
 
 - **replace bind**：destination 内受支持的路径操作只落到 source，不读取或修改 Pod 中原有的 destination；映射外路径保持 Pod 原语义。
 - **共享 source**：Projection 不持久化或缓存文件状态。多个独立 invocation 及外部 writer 可以并发共享 source，可见性、原子性和同文件写冲突遵循底层文件系统语义。
-- **可启动性优先**：合法请求在 command 执行前发现 bind view 不可用时降级为 passthrough，以原 command、参数、继承环境和工作目录执行。
+- **准备与降级分离**：caller 提供已经存在且对实际执行身份可遍历的 source/cwd；pathshim 不创建、chmod/chown 或回收这些目录。无效映射或访问错误在 command 启动前明确失败，`--quiet` 不能隐藏。仅合法请求的机制不可用可降级为 passthrough，保留原 command、参数、继承环境和工作目录。
 - **进程语义透明**：pathshim 不创建进程组，不承担 init/tini 职责；它继承 caller PGID、转发常见终止信号，并保留 command 的 exit/signal 终态。
 - **覆盖必须诚实**：best effort 表示 syscall 覆盖不完整。未覆盖操作可能绕过映射访问 Pod 原路径，不得描述成完整 bind mount。
 
@@ -41,11 +41,13 @@ tests/
 
 ## 开发约定
 
+- 检查统一走 Makefile：`make format` 格式化，`make lint` 检查格式及 Clippy，`make test` 执行 Cargo 测试；自动化使用 `repocli validate`。Linux E2E 属于 `make test`，Docker/ffmpeg smoke 仍使用独立脚本。
+
 - 每个可发布改动都必须递增根目录 `VERSION`，默认提升 patch 版本，并同步 `Cargo.toml` 与 `Cargo.lock`；CLI 测试负责校验版本源一致。
 - 不把网络、权限限制和进程治理带入 pathshim；bind path mapping 是唯一职责。
 - CLI 只表达 source、guest destination、cwd 和 command，不把 seccomp 等底层机制暴露成调用方概念。
 - 普通运行输出实际模式和降级原因；集成方可用 `--quiet` 防止诊断混入 command stderr。
-- 常驻集成方使用 `pathshim probe --bind SOURCE:DEST` 做启动期能力探测；probe 必须复用真实 bind-view 握手、不运行用户 command，并通过稳定退出码区分可用与降级。
+- 常驻集成方使用 `pathshim probe --bind SOURCE:DEST [--cwd PATH]` 做启动期能力探测；probe 必须在预期执行身份下验证全部 source 和 cwd，并复用真实 bind-view 握手、不运行用户 command，并通过稳定退出码区分可用与降级。
 - Linux 行为测试至少覆盖动态链接程序、静态 Go 程序、mapped execve/execveat、子进程继承、多个独立 invocation 共享 source、外部 writer、guest cwd、映射外透传和 signal 终态。
 - 正确性 E2E、依赖外部 command/image 的 smoke、以及只报告现场覆盖程度的 capability audit 保持不同 verdict，不能把 skip 或已知 bypass 描述成通过完整映射。
 

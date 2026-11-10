@@ -38,16 +38,20 @@ pathshim 基于现场行为探测选择模式，不维护发行版或内核版�
 ## 运行流程
 
 1. `cli` 解析 repeatable bind、guest cwd、quiet 和 command；缺少 bind 或 command 属于参数错误。
-2. BindView 创建 source、规范化 destination、拒绝重复或保留路径，并按 destination 长度排列 Projection。
-3. 主流程解析初始 cwd；映射内目录缺失时在 source 创建，无法使用时回退 guest `/`。
-4. Linux child 安装 seccomp user-notification filter，把 listener fd 交给 parent；parent 启动 filesystem supervisor，双方在 command `exec` 前完成握手和真实映射探测。
+2. BindView 规范化 destination，拒绝重复或保留路径；逐一验证 caller 准备的 source 已存在、是目录且对有效身份可遍历，按 destination 长度排列 Projection。准备过程不创建或修改目录。
+3. 主流程按同一身份验证初始 cwd；缺失、非目录或权限不足均明确失败，不创建目录或改用 `/`。
+4. Linux child 安装 seccomp user-notification filter，把 listener fd 交给 parent；parent 启动 filesystem supervisor，双方在 command `exec` 前完成握手，并对全部 destination 和 cwd 进行真实映射探测。源目录只检查可遍历性及映射 stat；FD 注入通过启动阶段的一次性 `/dev/null` 句柄单独验证，不额外要求 source 目录可读写。一次性探测请求在 command exec 前消费，不改变程序之后的 `/proc/self/fd` 语义。
 5. 探测成功后进入 `bind-view`。受支持 filesystem syscall 由 `dispatch` 解析 guest 路径；`execve`/`execveat` 由 `execute` 打开 source executable、向 child 注入 close-on-exec fd，并通过短 `/dev/fd` 路径继续原 syscall。
-6. command 执行前发现映射不可用时进入 `passthrough`，重建原 command 以清除 guest cwd 和 `PWD`。
+6. 合法请求在 command 执行前发现机制不可用时进入 `passthrough`，重建原 command 以清除 guest cwd 和 `PWD`。
 7. parent 等待 command 终态，停止 filesystem supervisor，并把 exit code 或 signal 原样返回 caller。
 
 模式选择只发生在 command `exec` 之前；command 启动后不能通过重启切换模式，否则可能重复副作用。
 
-`pathshim probe --bind SOURCE:DEST` 复用第 2～5 步的真实握手与 Projection 探测，但只执行 pathshim 自身的内部零副作用 child，不接受或启动用户 command。`bind-view` 对应退出码 0，正常运行将降级时返回 `passthrough` 与退出码 1，参数错误仍返回 2；常驻 caller 可据此在启动时决定是否启用 pathshim。
+`pathshim probe --bind SOURCE:DEST [--cwd PATH]` 复用第 2～5 步的真实握手与 Projection 探测，但只执行 pathshim 自身的内部零副作用 child，不接受或启动用户 command。`bind-view` 对应退出码 0，正常运行将降级时返回 `passthrough` 与退出码 1，声明、source/cwd 准备错误返回 2，stderr 带阶段、路径和 errno，不输出 passthrough；常驻 caller 可据此在启动时决定是否启用 pathshim。
+
+探测必须以实际 command 将使用的 UID/GID、附加组和安全策略运行；pathshim 不提权，不代管
+caller 的目录生命周期，也不把权限错误伪装成环境能力降级。常规运行和 probe 共用准备逻辑。
+检查仅描述当前可遍历性，不承诺后续任意文件操作可读写，也不能消除运行期间路径变化的竞态。
 
 ## 路径与并发
 

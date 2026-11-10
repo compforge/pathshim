@@ -106,6 +106,31 @@ fn handle_open(listener: RawFd, state: &mut State, notif: &SeccompNotif) -> io::
         Ok(path) => path,
         Err(error) => return respond_error(listener, notif.id, errno(&error)),
     };
+    // One startup-only request verifies ADDFD without reading caller directories.
+    // Consume it before user exec so ordinary /proc/self/fd paths keep their semantics.
+    if state
+        .injection_probe
+        .as_ref()
+        .is_some_and(|probe| probe.child == notif.pid && probe.path == virtual_path)
+    {
+        let probe = state
+            .injection_probe
+            .take()
+            .expect("matched injection probe");
+        return match seccomp::add_fd(
+            listener,
+            &SeccompNotifAddfd {
+                id: notif.id,
+                flags: seccomp::ADDFD_FLAG_SEND,
+                srcfd: probe.source.as_raw_fd() as u32,
+                newfd: 0,
+                newfd_flags: 0,
+            },
+        ) {
+            Ok(_) => Ok(()),
+            Err(error) => respond_error(listener, notif.id, errno(&error)),
+        };
+    }
     if !state.view.projects(&virtual_path) {
         return respond_continue(listener, notif.id);
     }
