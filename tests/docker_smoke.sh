@@ -118,4 +118,24 @@ test ! -e "$run_dir/passthrough-source/passthrough-output"
 test "$passthrough_output" = "$(cat "$run_dir/passthrough-destination/passthrough-output")"
 assert_mode "$run_dir/passthrough.stderr" passthrough
 
-printf 'pathshim Docker smoke passed: arch=%s modes=bind-view,passthrough probe=verified\n' "$(uname -m)"
+# Invalid caller state is an error even when the mechanism itself is denied.
+for invocation in run probe; do
+  args=(--quiet --bind /missing:/guest -- /fixture /guest/invalid-output)
+  if [ "$invocation" = probe ]; then
+    args=(probe --bind /missing:/guest)
+  fi
+  set +e
+  "${docker_run[@]}" \
+    --security-opt "seccomp=$deny_profile" \
+    --volume "$run_dir/passthrough-destination:/guest" \
+    "$image" /pathshim "${args[@]}" \
+    >"$run_dir/invalid-$invocation.stdout" 2>"$run_dir/invalid-$invocation.stderr"
+  status=$?
+  set -e
+  test "$status" -eq 2
+  test ! -s "$run_dir/invalid-$invocation.stdout"
+  test ! -e "$run_dir/passthrough-destination/invalid-output"
+  grep -q 'stage=source' "$run_dir/invalid-$invocation.stderr"
+done
+
+printf 'pathshim Docker smoke passed: arch=%s modes=bind-view,passthrough probe=verified invalid-invocation=verified\n' "$(uname -m)"

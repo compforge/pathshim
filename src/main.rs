@@ -42,41 +42,13 @@ fn main() {
             println!("pathshim {}", VERSION.trim());
             return;
         }
-        ParseResult::Probe(args) => probe(bind_specs(args.binds)),
+        ParseResult::Probe(args) => probe(bind_specs(args.binds), &args.cwd),
     };
 
     let mut command = Command::new(&args.command);
     command.args(&args.args);
     let binds = bind_specs(args.binds);
-    let view = match BindView::open(&binds) {
-        Ok(view) => view,
-        Err(error) => {
-            diagnostic(
-                args.quiet,
-                format!(
-                    "collect mode=passthrough reason=bind-view-unavailable binds={} error={error}",
-                    binds.len()
-                ),
-            );
-            exec(command);
-        }
-    };
-    let guest_cwd = match view.resolve_directory(&args.cwd) {
-        Ok(cwd) => cwd,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            match view.create_directory_all(&args.cwd) {
-                Ok(cwd) => {
-                    diagnostic(
-                        args.quiet,
-                        format!("created guest cwd path={}", cwd.display()),
-                    );
-                    cwd
-                }
-                Err(error) => fallback_guest_cwd(args.quiet, &args.cwd, error),
-            }
-        }
-        Err(error) => fallback_guest_cwd(args.quiet, &args.cwd, error),
-    };
+    let (view, guest_cwd) = prepare_view(&binds, &args.cwd);
     configure_virtual_environment(&mut command, &guest_cwd);
 
     run(view, command, args.quiet);
@@ -92,29 +64,48 @@ fn bind_specs(binds: Vec<cli::BindArg>) -> Vec<BindSpec> {
         .collect()
 }
 
-fn probe(binds: Vec<BindSpec>) -> ! {
-    let view = match BindView::open(&binds) {
-        Ok(view) => view,
-        Err(error) => probe_unavailable(format!("bind-view-unavailable error={error}")),
-    };
-    probe_view(view)
+// +spec=`Invalid mappings and inaccessible source/cwd paths fail before command startup, including quiet mode. Only mechanism unavailability may select passthrough.`
+// +link=component://docs/kernel.md
+fn prepare_view(binds: &[BindSpec], cwd: &Path) -> (BindView, std::path::PathBuf) {
+    let view = BindView::open(binds).unwrap_or_else(|error| invocation_error(error));
+    let cwd = view
+        .resolve_directory(cwd)
+        .unwrap_or_else(|error| invocation_error(error));
+    (view, cwd)
+}
+
+fn invocation_error(error: std::io::Error) -> ! {
+    eprintln!("pathshim: invalid invocation: {error}");
+    process::exit(2);
+}
+
+fn probe(binds: Vec<BindSpec>, cwd: &Path) -> ! {
+    let (view, cwd) = prepare_view(&binds, cwd);
+    probe_view(view, &cwd)
 }
 
 #[cfg(target_os = "linux")]
-fn probe_view(view: BindView) -> ! {
+fn probe_view(view: BindView, cwd: &Path) -> ! {
     let mut command = Command::new("/proc/self/exe");
     command.arg(PROBE_CHILD_ARG);
+    configure_virtual_environment(&mut command, cwd);
     match linux::run(view, command, true) {
         Ok(linux::RunOutcome::Exited(linux::ChildStatus::Exited(0))) => {
             println!("bind-view");
             process::exit(0);
         }
         Ok(linux::RunOutcome::Unavailable { reason, .. }) => probe_unavailable(reason),
-        Ok(linux::RunOutcome::Exited(status)) => probe_unavailable(format!(
-            "probe-child-failed status={}",
-            display_status(status)
-        )),
-        Err(error) => probe_unavailable(format!("bind-view-probe-failed error={error}")),
+        Ok(linux::RunOutcome::Exited(status)) => {
+            eprintln!(
+                "pathshim: probe child failed: status={}",
+                display_status(status)
+            );
+            process::exit(1);
+        }
+        Err(error) => {
+            eprintln!("pathshim: probe failed: {error}");
+            process::exit(1);
+        }
     }
 }
 
@@ -127,7 +118,7 @@ fn display_status(status: linux::ChildStatus) -> String {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn probe_view(_view: BindView) -> ! {
+fn probe_view(_view: BindView, _cwd: &Path) -> ! {
     probe_unavailable("bind-view-requires-linux".to_owned())
 }
 
@@ -143,17 +134,6 @@ fn diagnostic(quiet: bool, message: String) {
     }
 }
 
-fn fallback_guest_cwd(quiet: bool, requested: &Path, error: std::io::Error) -> std::path::PathBuf {
-    diagnostic(
-        quiet,
-        format!(
-            "guest cwd unavailable requested={} fallback=/ error={error}",
-            requested.display()
-        ),
-    );
-    Path::new("/").to_path_buf()
-}
-
 fn configure_virtual_environment(command: &mut Command, guest_cwd: &Path) {
     command.current_dir(guest_cwd).env("PWD", guest_cwd);
 }
@@ -167,7 +147,7 @@ fn run(view: BindView, command: Command, quiet: bool) -> ! {
             exec(passthrough_command(&command));
         }
         Err(error) => {
-            eprintln!("pathshim: bind view failed after command startup: {error}");
+            eprintln!("pathshim: bind-view execution failed: {error}");
             process::exit(1);
         }
     }

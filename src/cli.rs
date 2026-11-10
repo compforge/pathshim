@@ -7,7 +7,7 @@ Run a command with best-effort bind path mappings.
 Usage:
   pathshim -b <SOURCE:DEST> [-b <SOURCE:DEST> ...] [-w <PATH>] [--] <COMMAND> [ARGS...]
   pathshim --bind=<SOURCE:DEST> [--cwd=<PATH>] [--quiet] [--] <COMMAND> [ARGS...]
-  pathshim probe -b <SOURCE:DEST> [-b <SOURCE:DEST> ...]
+  pathshim probe -b <SOURCE:DEST> [-b <SOURCE:DEST> ...] [-w <PATH>]
 
 Commands:
   probe                Test whether bind-view works without running a user command
@@ -40,6 +40,7 @@ pub(crate) struct BindArg {
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct ProbeArgs {
     pub(crate) binds: Vec<BindArg>,
+    pub(crate) cwd: PathBuf,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -148,6 +149,7 @@ where
 {
     let mut args = args.into_iter();
     let mut binds = Vec::new();
+    let mut cwd = PathBuf::from("/");
     while let Some(arg) = args.next() {
         if arg == "-h" || arg == "--help" {
             return Ok(ParseResult::Help);
@@ -163,15 +165,32 @@ where
             binds.push(parse_bind(OsString::from(value))?);
             continue;
         }
+        if arg == "-w" || arg == "--cwd" || arg == "--pwd" {
+            let value = args
+                .next()
+                .ok_or_else(|| format!("`{}` requires a path", arg.to_string_lossy()))?;
+            cwd = PathBuf::from(value);
+            continue;
+        }
+        if let Some(value) = arg.to_str().and_then(|arg| {
+            arg.strip_prefix("--cwd=")
+                .or_else(|| arg.strip_prefix("--pwd="))
+        }) {
+            if value.is_empty() {
+                return Err("`--cwd` requires a path".to_owned());
+            }
+            cwd = PathBuf::from(value);
+            continue;
+        }
         return Err(format!(
-            "unexpected probe argument `{}`: only --bind is supported",
+            "unexpected probe argument `{}`: only --bind and --cwd are supported",
             arg.to_string_lossy()
         ));
     }
     if binds.is_empty() {
         return Err("probe requires at least one `--bind SOURCE:DEST`".to_owned());
     }
-    Ok(ParseResult::Probe(ProbeArgs { binds }))
+    Ok(ParseResult::Probe(ProbeArgs { binds, cwd }))
 }
 
 fn parse_bind(value: OsString) -> Result<BindArg, String> {
@@ -292,6 +311,7 @@ mod tests {
         assert_eq!(
             result,
             ParseResult::Probe(ProbeArgs {
+                cwd: PathBuf::from("/"),
                 binds: vec![
                     BindArg {
                         source: PathBuf::from("/upper/one"),
@@ -304,6 +324,23 @@ mod tests {
                 ],
             })
         );
+    }
+
+    #[test]
+    fn probe_accepts_guest_cwd_aliases() {
+        for option in ["-w", "--cwd", "--pwd"] {
+            let ParseResult::Probe(args) = parse(os_args(&[
+                "probe",
+                "--bind",
+                "/source:/guest",
+                option,
+                "/guest/sub",
+            ]))
+            .unwrap() else {
+                panic!("expected probe arguments");
+            };
+            assert_eq!(args.cwd, PathBuf::from("/guest/sub"));
+        }
     }
 
     #[test]

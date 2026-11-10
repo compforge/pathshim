@@ -62,6 +62,30 @@ fn probe_reports_bind_view_without_running_a_user_command() {
     assert!(fs::read_dir(&paths.source).unwrap().next().is_none());
 }
 
+// +case:id=search_only_source_probe,desc=`Probe several caller-owned sources and a guest cwd as an unprivileged user`,expect=`All mappings are usable without requiring directory read or write permission`
+#[test]
+fn probe_accepts_search_only_sources_and_checks_guest_cwd() {
+    use std::os::unix::fs::PermissionsExt;
+    let paths = TestPaths::new();
+    let second = paths.base.join("second");
+    fs::create_dir_all(second.join("cwd")).unwrap();
+    fs::set_permissions(&second, fs::Permissions::from_mode(0o111)).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_pathshim"))
+        .args(["probe", "--bind"])
+        .arg(format!("{}:/workspace", paths.source.display()))
+        .arg("--bind")
+        .arg(format!("{}:/other", second.display()))
+        .args(["--cwd", "/other/cwd"])
+        .output()
+        .unwrap();
+    let mode = fs::metadata(&second).unwrap().permissions().mode() & 0o777;
+    fs::set_permissions(&second, fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.stdout, b"bind-view\n");
+    assert_eq!(mode, 0o111);
+    assert!(fs::read_dir(second.join("cwd")).unwrap().next().is_none());
+}
+
 #[test]
 fn bind_replaces_selected_subtree_and_leaves_outside_paths_alone() {
     let paths = TestPaths::new();

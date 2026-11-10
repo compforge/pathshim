@@ -70,9 +70,12 @@ impl BindView {
                     format!("duplicate bind destination: {}", destination.display()),
                 ));
             }
-            fs::create_dir_all(&bind.source)?;
+            validate_directory(&bind.source)
+                .map_err(|error| mapping_error("source", &bind.source, &destination, error))?;
+            let source = fs::canonicalize(&bind.source)
+                .map_err(|error| mapping_error("source", &bind.source, &destination, error))?;
             projections.push(Projection {
-                source: fs::canonicalize(&bind.source)?,
+                source,
                 destination,
             });
         }
@@ -98,12 +101,23 @@ impl BindView {
         self.projections.len()
     }
 
-    pub(crate) fn probe_path(&self) -> &Path {
-        &self
-            .projections
-            .first()
-            .expect("a bind view has at least one projection")
-            .destination
+    pub(crate) fn probe_paths(&self) -> Vec<PathBuf> {
+        self.projections
+            .iter()
+            .map(|p| p.destination.clone())
+            .collect()
+    }
+
+    pub(crate) fn path_error(
+        &self,
+        stage: &str,
+        destination: &Path,
+        error: io::Error,
+    ) -> io::Error {
+        match self.resolve_projected(destination) {
+            Ok(source) => mapping_error(stage, &source, destination, error),
+            Err(_) => mapping_error(stage, destination, destination, error),
+        }
     }
 
     pub(crate) fn projects(&self, virtual_path: &Path) -> bool {
@@ -132,20 +146,8 @@ impl BindView {
     pub(crate) fn resolve_directory(&self, virtual_path: &Path) -> io::Result<PathBuf> {
         let virtual_path = normalize_virtual(virtual_path)?;
         let real_path = self.resolve_projected(&virtual_path)?;
-        match real_path.metadata() {
-            Ok(metadata) if metadata.is_dir() => Ok(virtual_path),
-            Ok(_) => Err(io::Error::from_raw_os_error(libc_errno::ENOTDIR)),
-            Err(error) => Err(error),
-        }
-    }
-
-    pub(crate) fn create_directory_all(&self, virtual_path: &Path) -> io::Result<PathBuf> {
-        let virtual_path = normalize_virtual(virtual_path)?;
-        if self.projection_index(&virtual_path).is_none() {
-            return Err(io::Error::from_raw_os_error(libc_errno::ENOTSUP));
-        }
-        let real_path = self.resolve_projected(&virtual_path)?;
-        fs::create_dir_all(real_path)?;
+        validate_directory(&real_path)
+            .map_err(|error| mapping_error("cwd", &real_path, &virtual_path, error))?;
         Ok(virtual_path)
     }
 
@@ -303,10 +305,40 @@ fn metadata_to_dir_type(metadata: &fs::Metadata) -> u8 {
     }
 }
 
+// +spec=`Caller-owned source and cwd directories must already exist and be searchable by the effective invocation identity; preparation never creates or changes them.`
+// +link=component://docs/kernel.md
+fn validate_directory(path: &Path) -> io::Result<()> {
+    if !fs::metadata(path)?.is_dir() {
+        return Err(io::Error::from_raw_os_error(libc_errno::ENOTDIR));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let path = std::ffi::CString::new(path.as_os_str().as_bytes())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))?;
+        // access(2) checks real IDs; execution and the supervisor use effective IDs.
+        if unsafe { libc::faccessat(libc::AT_FDCWD, path.as_ptr(), libc::X_OK, libc::AT_EACCESS) }
+            < 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+fn mapping_error(stage: &str, source: &Path, destination: &Path, error: io::Error) -> io::Error {
+    io::Error::new(
+        error.kind(),
+        format!(
+            "stage={stage} source={source:?} destination={destination:?} errno={:?} error={error}",
+            error.raw_os_error()
+        ),
+    )
+}
+
 mod libc_errno {
     pub(super) const EXDEV: i32 = 18;
     pub(super) const ENOTDIR: i32 = 20;
-    pub(super) const ENOTSUP: i32 = 95;
 }
 
 #[cfg(test)]
@@ -335,6 +367,7 @@ mod tests {
     }
 
     fn view(source: &Path, destination: &str) -> BindView {
+        fs::create_dir_all(source).expect("prepare source fixture");
         BindView::open(&[BindSpec {
             source: source.to_path_buf(),
             destination: PathBuf::from(destination),
@@ -381,6 +414,7 @@ mod tests {
         let temp = TempDir::new();
         let workspace = temp.0.join("workspace");
         let cache = workspace.join("cache");
+        fs::create_dir_all(&cache).unwrap();
         let view = BindView::open(&[
             BindSpec {
                 source: workspace.clone(),
@@ -405,17 +439,16 @@ mod tests {
     }
 
     #[test]
-    fn creates_missing_guest_cwd_inside_bind() {
+    fn missing_guest_cwd_is_rejected_without_creation() {
         let temp = TempDir::new();
         let source = temp.0.join("source");
         let view = view(&source, "/workspace");
-
-        assert_eq!(
-            view.create_directory_all(Path::new("/workspace/project"))
-                .unwrap(),
-            PathBuf::from("/workspace/project")
-        );
-        assert!(source.join("project").is_dir());
+        let error = view
+            .resolve_directory(Path::new("/workspace/project"))
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert!(error.to_string().contains("stage=cwd"));
+        assert!(!source.join("project").exists());
     }
 
     #[test]

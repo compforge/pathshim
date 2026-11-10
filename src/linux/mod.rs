@@ -51,8 +51,15 @@ pub(crate) fn exit_with_status(status: ChildStatus) -> ! {
     }
 }
 
+struct InjectionProbe {
+    child: u32,
+    path: PathBuf,
+    source: OwnedFd,
+}
+
 pub(crate) struct State {
     view: BindView,
+    injection_probe: Option<InjectionProbe>,
     directories: HashMap<(u32, i32), OpenDirectory>,
     virtual_cwds: HashMap<u32, PathBuf>,
 }
@@ -64,9 +71,10 @@ pub(crate) struct OpenDirectory {
 }
 
 impl State {
-    fn new(view: BindView) -> Self {
+    fn new(view: BindView, injection_probe: InjectionProbe) -> Self {
         Self {
             view,
+            injection_probe: Some(injection_probe),
             directories: HashMap::new(),
             virtual_cwds: HashMap::new(),
         }
@@ -74,15 +82,20 @@ impl State {
 }
 
 pub(crate) fn run(view: BindView, mut command: Command, quiet: bool) -> io::Result<RunOutcome> {
-    let supervisor_view = match view.reopen() {
-        Ok(view) => view,
-        Err(error) => {
-            return Ok(RunOutcome::Unavailable {
-                command,
-                reason: format!("bind-view-setup-failed error={error}"),
-            });
+    let supervisor_view = view.reopen()?;
+    let mut probe_paths = view.probe_paths();
+    if let Some(cwd) = command.get_current_dir() {
+        if !probe_paths.iter().any(|path| path == cwd) {
+            probe_paths.push(cwd.to_path_buf());
         }
+    }
+    // A caller's directory may be searchable but not readable. Probe FD injection
+    // with a private inherited /dev/null handle, independently of directory grants.
+    let probe_file: OwnedFd = match std::fs::File::open("/dev/null") {
+        Ok(file) => file.into(),
+        Err(error) => return Ok(unavailable(command, "fd-probe-source-unavailable", error)),
     };
+    let probe_path = PathBuf::from(format!("/proc/self/fd/{}", probe_file.as_raw_fd()));
     let (parent_socket, child_socket) = match socket_pair() {
         Ok(sockets) => sockets,
         Err(error) => {
@@ -102,7 +115,7 @@ pub(crate) fn run(view: BindView, mut command: Command, quiet: bool) -> io::Resu
         // The caller owns the execution process group. Fork and exec preserve
         // that PGID; creating a nested group here would let the command escape
         // a supervisor that kills pathshim's group as one execution.
-        child_main(child_socket, &mut command, view.probe_path());
+        child_main(child_socket, &mut command, &probe_paths, &probe_path);
     }
     drop(child_socket);
 
@@ -122,12 +135,19 @@ pub(crate) fn run(view: BindView, mut command: Command, quiet: bool) -> io::Resu
             return Ok(unavailable(command, "bind-view-unavailable", error));
         }
     };
+    let injection_probe = InjectionProbe {
+        child: pid as u32,
+        path: probe_path,
+        source: probe_file,
+    };
     let stop = Arc::new(AtomicBool::new(false));
     let supervisor_stop = Arc::clone(&stop);
     let supervisor = match std::thread::Builder::new()
         .name("pathshim-fs".to_owned())
         .spawn(move || {
-            if let Err(error) = supervise(listener, supervisor_view, supervisor_stop) {
+            if let Err(error) =
+                supervise(listener, supervisor_view, supervisor_stop, injection_probe)
+            {
                 if !quiet {
                     eprintln!("pathshim: filesystem supervisor stopped: {error}");
                 }
@@ -175,14 +195,23 @@ pub(crate) fn run(view: BindView, mut command: Command, quiet: bool) -> io::Resu
         }
     };
     if probe_error != 0 {
+        let index = read_i32_timeout(parent_socket.as_raw_fd(), PROBE_TIMEOUT_MS);
         drop(signal_forwarding);
         stop_attempt(pid, &stop, supervisor);
+        // Source changes during setup are invocation failures, not missing kernel features.
+        view.reopen()?;
+        if let Some(cwd) = command.get_current_dir() {
+            view.resolve_directory(cwd)?;
+        }
+        let path = index.ok().and_then(|index| probe_paths.get(index as usize));
+        let error = io::Error::from_raw_os_error(probe_error);
+        let reason = match path {
+            Some(path) => view.path_error("probe", path, error).to_string(),
+            None => format!("stage=fd_injection errno={probe_error} error={error}"),
+        };
         return Ok(RunOutcome::Unavailable {
             command,
-            reason: format!(
-                "bind-view-probe-failed error={}",
-                io::Error::from_raw_os_error(probe_error)
-            ),
+            reason: format!("bind-view-probe-failed {reason}"),
         });
     }
 
@@ -263,7 +292,12 @@ extern "C" fn forward_signal(signal: i32) {
     }
 }
 
-fn child_main(socket: OwnedFd, command: &mut Command, probe_path: &Path) -> ! {
+fn child_main(
+    socket: OwnedFd,
+    command: &mut Command,
+    probe_paths: &[PathBuf],
+    injection_path: &Path,
+) -> ! {
     let listener = match seccomp::install_listener() {
         Ok(listener) => listener,
         Err(error) => {
@@ -279,12 +313,23 @@ fn child_main(socket: OwnedFd, command: &mut Command, probe_path: &Path) -> ! {
     if let Err(error) = read_byte(socket.as_raw_fd()) {
         child_error(format!("cannot synchronize filesystem supervisor: {error}"));
     }
-    if let Err(error) = probe_projection(probe_path) {
+    if let Err(error) = probe_injection(injection_path) {
         let _ = write_i32(
             socket.as_raw_fd(),
             error.raw_os_error().unwrap_or(libc::EIO),
         );
+        let _ = write_i32(socket.as_raw_fd(), -1);
         unsafe { libc::_exit(0) }
+    }
+    for (index, path) in probe_paths.iter().enumerate() {
+        if let Err(error) = probe_projection(path) {
+            let _ = write_i32(
+                socket.as_raw_fd(),
+                error.raw_os_error().unwrap_or(libc::EIO),
+            );
+            let _ = write_i32(socket.as_raw_fd(), index as i32);
+            unsafe { libc::_exit(0) }
+        }
     }
     if let Err(error) = write_i32(socket.as_raw_fd(), 0) {
         child_error(format!("cannot report filesystem probe: {error}"));
@@ -308,7 +353,13 @@ fn probe_projection(probe_path: &Path) -> io::Result<()> {
     if unsafe { libc::fstatat(libc::AT_FDCWD, path.as_ptr(), &mut stat, 0) } < 0 {
         return Err(io::Error::last_os_error());
     }
-    let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY) };
+    Ok(())
+}
+
+fn probe_injection(probe_path: &Path) -> io::Result<()> {
+    let path = std::ffi::CString::new(probe_path.as_os_str().as_bytes())
+        .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
+    let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY) };
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -321,8 +372,13 @@ fn child_error(message: String) -> ! {
     unsafe { libc::_exit(1) }
 }
 
-fn supervise(listener: OwnedFd, view: BindView, stop: Arc<AtomicBool>) -> io::Result<()> {
-    let mut state = State::new(view);
+fn supervise(
+    listener: OwnedFd,
+    view: BindView,
+    stop: Arc<AtomicBool>,
+    injection_probe: InjectionProbe,
+) -> io::Result<()> {
+    let mut state = State::new(view, injection_probe);
     while !stop.load(Ordering::Acquire) {
         let mut poll_fd = libc::pollfd {
             fd: listener.as_raw_fd(),

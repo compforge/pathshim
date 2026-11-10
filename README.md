@@ -9,6 +9,7 @@ pathshim --bind <source:guest-destination> [--cwd <guest-path>] -- <command> [ar
 It is useful when several processes need a stable path such as `/workspace`, while their real data lives elsewhere:
 
 ```console
+mkdir -p /var/lib/session-1/workspace
 pathshim \
   --bind /var/lib/session-1/workspace:/workspace \
   --cwd /workspace \
@@ -22,7 +23,7 @@ Within supported filesystem operations, `/workspace/result.txt` now refers to `/
 - A bind is a replace mapping: paths below guest `DEST` resolve only below physical `SOURCE`. The Pod's original `DEST` tree is not a read fallback.
 - Binds may be repeated. When destinations overlap, the longest matching destination wins.
 - Paths outside every bind retain their normal Pod filesystem semantics.
-- A missing source is created recursively when its parent is writable.
+- Sources must already be directories searchable by the invocation's effective identity, including every ancestor. The caller prepares their ownership, permissions and lifecycle; pathshim never creates or repairs them.
 - `DEST` must be absolute, below `/`, and outside `/dev`, `/proc`, and `/sys`.
 - A bind view stores no metadata. Independent pathshim invocations and external writers may share a source concurrently; visibility and write races follow the backing filesystem.
 
@@ -32,9 +33,10 @@ Within supported filesystem operations, `/workspace/result.txt` now refers to `/
 
 Use `-w`, `--cwd`, or `--pwd` to choose the initial guest cwd. The default is `/`.
 
-When a requested cwd is inside a bind, pathshim checks it in the source and creates it when missing. A non-directory or unavailable cwd emits a diagnostic and falls back to `/`.
+The requested cwd must already exist, be a directory and be searchable by the invocation's effective identity. A missing, non-directory or inaccessible cwd fails before command startup; pathshim neither creates it nor substitutes `/`.
 
 ```console
+mkdir -p /var/lib/session-1/workspace/project
 pathshim \
   --bind /var/lib/session-1/workspace:/workspace \
   --cwd /workspace/project \
@@ -47,22 +49,29 @@ The command sees `/workspace/project`; the output is stored at `/var/lib/session
 
 pathshim probes the actual node instead of maintaining a kernel or distribution allowlist:
 
-1. `bind-view` verifies seccomp user notification, parent-to-child memory access, file descriptor injection, and a configured destination before command startup.
+1. `bind-view` verifies seccomp user notification, parent-to-child memory access, file descriptor injection, and every configured destination plus the requested cwd before command startup.
 2. `passthrough` runs the original command and arguments with inherited environment and caller cwd when bind-view cannot be installed.
 
 The selected mode and degradation reason are written to stderr. Integrations that keep control-plane diagnostics separate from command output can use `--quiet`.
 
-Command startup takes priority over mapping. Once a command has started, pathshim never restarts it in another mode because doing so could repeat side effects.
+For valid requests, command startup takes priority over mechanism availability. Invalid mappings or source/cwd access errors exit `2` without running the command, including under `--quiet`. Source and cwd errors identify the stage, physical source, guest destination and underlying errno. This validation is read-only and is not a promise that every future file operation will be permitted. Once a command has started, pathshim never restarts it in another mode because doing so could repeat side effects.
 
 ### Startup probe
 
 Long-running callers can test the exact bind configuration during startup without running a user command:
 
 ```console
-pathshim probe --bind /var/lib/session-probe/workspace:/workspace
+mkdir -p /var/lib/session-probe/workspace
+pathshim probe --bind /var/lib/session-probe/workspace:/workspace --cwd /workspace
 ```
 
-The probe performs the same seccomp listener handshake and live Projection checks used before a normal command. It prints `bind-view` and exits `0` when mapping is available; it prints `passthrough` and exits `1` when a normal invocation would degrade, with the reason on stderr. Invalid CLI input exits `2`. The caller owns the probe source directory and may remove it afterward.
+The probe performs the same seccomp listener handshake and live Projection checks used before a normal command. It prints `bind-view` and exits `0` when mapping is available; it prints `passthrough` and exits `1` when a normal invocation would degrade, with the reason on stderr. Invalid CLI input, mappings, sources or cwd exit `2` without a mode on stdout. Internal probe errors also fail without claiming passthrough. Run the probe under the same UID, GID, groups and security policy as the intended invocation; a root probe does not establish access for another UID. Directory search permission is required, not directory read/write permission. The caller owns the probe sources and may remove them afterward.
+
+### Compatibility in 0.1.7
+
+Older versions created missing sources and guest cwd paths, substituted `/` for invalid cwd,
+and could run passthrough after a mapping preparation error. Callers must now prepare sources
+and cwd explicitly. Mechanism-unavailable fallback and command exit/signal forwarding remain.
 
 ## Kubernetes and Linux requirements
 
